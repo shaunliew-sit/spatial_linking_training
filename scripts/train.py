@@ -53,8 +53,14 @@ from data.dataset import load_combined_dataset, create_train_val_split
 from utils.logging_utils import setup_logging, setup_wandb, log_model_info, finish_wandb
 
 def setup_file_logging(output_dir: str, run_id: str = None):
-    """Setup logging to both console and file with unique run ID."""
+    """Setup logging to both console and file with unique run ID.
+    
+    Captures DEBUG level to file and INFO to console.
+    Also sets up exception hook to log uncaught exceptions.
+    """
     import datetime
+    import sys
+    import traceback
     
     # Generate unique run ID if not provided
     if run_id is None:
@@ -65,27 +71,61 @@ def setup_file_logging(output_dir: str, run_id: str = None):
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / "training.log"
     
-    # Create formatter
-    formatter = logging.Formatter(
-        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    # Create detailed formatter for file (includes more info)
+    file_formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     )
     
-    # File handler
-    file_handler = logging.FileHandler(log_file, mode='a')
-    file_handler.setLevel(logging.INFO)
-    file_handler.setFormatter(formatter)
+    # Simpler formatter for console
+    console_formatter = logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
     
-    # Console handler
+    # File handler - capture DEBUG and above (more detailed)
+    file_handler = logging.FileHandler(log_file, mode='a')
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(file_formatter)
+    
+    # Console handler - INFO and above
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(formatter)
+    console_handler.setFormatter(console_formatter)
     
     # Setup root logger
     root_logger = logging.getLogger()
-    root_logger.setLevel(logging.INFO)
+    root_logger.setLevel(logging.DEBUG)
+    # Remove existing handlers to avoid duplicates
+    root_logger.handlers.clear()
     root_logger.addHandler(file_handler)
     root_logger.addHandler(console_handler)
+    
+    # Also configure transformers and other library loggers
+    for lib_name in ['transformers', 'datasets', 'peft', 'trl', 'accelerate']:
+        lib_logger = logging.getLogger(lib_name)
+        lib_logger.setLevel(logging.DEBUG)
+        lib_logger.addHandler(file_handler)
+    
+    # Setup exception hook to log uncaught exceptions
+    def exception_hook(exc_type, exc_value, exc_traceback):
+        if issubclass(exc_type, KeyboardInterrupt):
+            # Don't log keyboard interrupt
+            sys.__excepthook__(exc_type, exc_value, exc_traceback)
+            return
+        
+        error_msg = ''.join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+        root_logger.error(f"Uncaught exception:\n{error_msg}")
+        # Also call the default hook
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+    
+    sys.excepthook = exception_hook
+    
+    # Log startup info
+    root_logger.info(f"=" * 80)
+    root_logger.info(f"Training started - Run ID: {run_id}")
+    root_logger.info(f"Log file: {log_file}")
+    root_logger.info(f"=" * 80)
     
     return log_file
 
@@ -154,12 +194,15 @@ def setup_model(config: Dict):
         device_map = "auto"
     
     # Load model with spatial linking
+    # Note: Using "sdpa" (Scaled Dot Product Attention) instead of "flash_attention_2"
+    # because flash-attn doesn't have official CUDA 13.0 wheels yet.
+    # SDPA is built into PyTorch 2.x and offers comparable performance.
     model = SpatialLinkingInteractionModel.from_pretrained(
         model_name,
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
         device_map=device_map,
-        attn_implementation="flash_attention_2",  # Use flash attention for speed
+        attn_implementation="sdpa",  # Use PyTorch's native SDPA (flash-attn requires CUDA 12.x)
     )
     
     # Set loss_type to avoid warning (set it regardless of whether it exists)
@@ -301,10 +344,21 @@ class FileLoggingCallback(TrainerCallback):
             else:
                 eta_str = "calculating..."
             
-            loss = logs.get('loss', 'N/A')
-            lr = logs.get('learning_rate', 0)
+            # Handle both training logs (loss) and evaluation logs (eval_loss)
+            loss = logs.get('loss', logs.get('eval_loss', None))
+            lr = logs.get('learning_rate', None)
             
-            self._log(f"Step {step}/{total} ({progress:.1f}%) | Loss: {loss:.4f} | LR: {lr:.2e} | Elapsed: {elapsed_str} | ETA: {eta_str}")
+            # Format loss safely (could be None or a number)
+            loss_str = f"{loss:.4f}" if isinstance(loss, (int, float)) else "N/A"
+            lr_str = f"{lr:.2e}" if isinstance(lr, (int, float)) else "N/A"
+            
+            # Check if this is an evaluation log
+            if 'eval_loss' in logs:
+                eval_loss = logs.get('eval_loss', 0)
+                eval_runtime = logs.get('eval_runtime', 0)
+                self._log(f"Evaluation | Step {step}/{total} | Eval Loss: {eval_loss:.4f} | Runtime: {eval_runtime:.1f}s")
+            else:
+                self._log(f"Step {step}/{total} ({progress:.1f}%) | Loss: {loss_str} | LR: {lr_str} | Elapsed: {elapsed_str} | ETA: {eta_str}")
     
     def on_train_end(self, args, state, control, **kwargs):
         import time
@@ -578,4 +632,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import traceback
+    try:
+        main()
+    except Exception as e:
+        # Ensure the error is logged before exiting
+        logger.error(f"Training failed with error: {e}")
+        logger.error(f"Full traceback:\n{traceback.format_exc()}")
+        raise

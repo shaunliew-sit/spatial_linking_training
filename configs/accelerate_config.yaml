@@ -1,5 +1,5 @@
 # Accelerate configuration for multi-GPU training
-# Usage: accelerate launch --config_file configs/accelerate_config.yaml scripts/train.py --config configs/sft_lora_config.yaml
+# Usage: accelerate launch --config_file configs/accelerate_config.yaml scripts/train.py --config configs/sft_lora_config_multi_gpu.yaml
 
 compute_environment: LOCAL_MACHINE
 debug: false
@@ -18,3 +18,4 @@ tpu_env: []
 tpu_use_cluster: false
 tpu_use_sudo: false
 use_cpu: false
+dynamo_backend: 'no'

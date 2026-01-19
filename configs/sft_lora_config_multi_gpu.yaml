@@ -58,11 +58,11 @@ learning_rate: 2.0e-5
 
 # Epochs and batch size
 # Per-GPU batch size x num_GPUs x gradient_accumulation = effective batch
-# Example: 4 x 8 x 2 = 64 effective batch size
+# Example: 10 x 8 x 2 = 160 effective batch size
 num_train_epochs: 3
-per_device_train_batch_size: 4      # Per GPU (conservative for 80GB H100/H200)
-per_device_eval_batch_size: 4
-gradient_accumulation_steps: 2      # Effective batch = 4 * 8 * 2 = 64
+per_device_train_batch_size: 10     # Per GPU (optimized for 144GB H200)
+per_device_eval_batch_size: 10
+gradient_accumulation_steps: 2      # Effective batch = 10 * 8 * 2 = 160
 
 # Optimizer
 optim: adamw_torch
@@ -93,8 +93,8 @@ logging_steps: 10
 
 # Checkpoint saving for resume capability
 save_strategy: steps
-save_steps: 50            # Save every 50 steps
-save_total_limit: 3       # Keep only last 3 checkpoints
+save_steps: 10            # Save every 10 steps (important: save before eval at step 30)
+save_total_limit: 5       # Keep last 5 checkpoints
 
 eval_strategy: epoch
 
