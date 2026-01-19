@@ -1,0 +1,103 @@
+# =============================================================================
+# Spatial Linking HOI Training Configuration - DGX Spark (128GB VRAM)
+# =============================================================================
+# Optimized for single GPU with 128GB VRAM
+
+# =============================================================================
+# Model Configuration
+# =============================================================================
+model_name_or_path: Qwen/Qwen3-VL-8B-Instruct
+trust_remote_code: true
+
+# Vision settings
+image_max_pixels: 1048576  # 1024x1024 max resolution
+
+# =============================================================================
+# LoRA Configuration
+# =============================================================================
+finetuning_type: lora
+lora_rank: 64
+lora_alpha: 128
+lora_target: all  # Options: all, or comma-separated: q_proj,v_proj,k_proj,o_proj
+lora_dropout: 0.05
+
+# =============================================================================
+# Freezing Strategy
+# =============================================================================
+freeze_vision_tower: true           # Freeze vision encoder
+freeze_multi_modal_projector: false # Keep projector trainable
+train_spatial_linking: true         # Train spatial linking module (always true)
+
+# =============================================================================
+# Dataset Configuration
+# =============================================================================
+# Use the processed dataset with refer_boxes
+cof_sft_file: /workspace/dataset/hoi_cof_sft/hoi_cof_sft_data_with_boxes.json
+
+# Image paths - relative paths in dataset are under this directory
+image_base_dir: /workspace/dataset/hoi_cof_sft/images
+
+# Validation split
+val_ratio: 0.05
+
+# =============================================================================
+# Training Hyperparameters - Optimized for 128GB VRAM
+# =============================================================================
+# Learning rate
+learning_rate: 2.0e-5
+
+# Epochs and batch size - INCREASED for 128GB VRAM
+num_train_epochs: 3
+per_device_train_batch_size: 16     # Increased for 128GB VRAM
+per_device_eval_batch_size: 16
+gradient_accumulation_steps: 2      # Effective batch size = 16 * 2 = 32
+
+# Optimizer
+optim: adamw_torch
+weight_decay: 0.01
+
+# Learning rate schedule
+warmup_ratio: 0.1
+lr_scheduler_type: cosine
+
+# Sequence length
+cutoff_len: 2048
+
+# =============================================================================
+# Precision and Memory
+# =============================================================================
+bf16: true
+fp16: false
+gradient_checkpointing: true
+
+# =============================================================================
+# Logging and Saving
+# =============================================================================
+output_dir: ./outputs/spatial_linking_sft_dgx
+logging_steps: 10
+
+# Checkpoint saving for resume capability
+save_strategy: steps      # Save by steps (not epoch) for better resume granularity
+save_steps: 50            # Save every 50 steps (~25 min with current settings)
+save_total_limit: 3       # Keep only last 3 checkpoints to save disk space
+
+eval_strategy: epoch
+
+# =============================================================================
+# WandB Configuration
+# =============================================================================
+report_to: wandb
+wandb_project: spatial-linking-hoi
+run_name: spatial_linking_lora_sft_dgx
+
+# =============================================================================
+# Advanced Options
+# =============================================================================
+# Preprocessing
+preprocessing_num_workers: 8
+
+# Seed for reproducibility
+seed: 42
+
+# Remove unused columns (important for VLM training)
+remove_unused_columns: false

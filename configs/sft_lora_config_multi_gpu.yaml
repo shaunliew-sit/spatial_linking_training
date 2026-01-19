@@ -1,0 +1,131 @@
+# =============================================================================
+# Spatial Linking HOI Training Configuration - Multi-GPU (H200/H100)
+# =============================================================================
+# Optimized for multi-GPU training on cloud (8x H200/H100)
+#
+# Usage:
+#   # With accelerate (recommended)
+#   accelerate launch --num_processes=8 scripts/train.py --config configs/sft_lora_config_multi_gpu.yaml
+#
+#   # With torchrun
+#   torchrun --nproc_per_node=8 scripts/train.py --config configs/sft_lora_config_multi_gpu.yaml
+#
+#   # With DeepSpeed
+#   accelerate launch --config_file configs/accelerate_config.yaml scripts/train.py --config configs/sft_lora_config_multi_gpu.yaml
+
+# =============================================================================
+# Model Configuration
+# =============================================================================
+model_name_or_path: Qwen/Qwen3-VL-8B-Instruct
+trust_remote_code: true
+
+# Vision settings
+image_max_pixels: 1048576  # 1024x1024 max resolution
+
+# =============================================================================
+# LoRA Configuration
+# =============================================================================
+finetuning_type: lora
+lora_rank: 64
+lora_alpha: 128
+lora_target: all  # Options: all, or comma-separated: q_proj,v_proj,k_proj,o_proj
+lora_dropout: 0.05
+
+# =============================================================================
+# Freezing Strategy
+# =============================================================================
+freeze_vision_tower: true           # Freeze vision encoder
+freeze_multi_modal_projector: false # Keep projector trainable
+train_spatial_linking: true         # Train spatial linking module (always true)
+
+# =============================================================================
+# Dataset Configuration
+# =============================================================================
+# Use the processed dataset with refer_boxes
+cof_sft_file: /workspace/dataset/hoi_cof_sft/hoi_cof_sft_data_with_boxes.json
+
+# Image paths - relative paths in dataset are under this directory
+image_base_dir: /workspace/dataset/hoi_cof_sft/images
+
+# Validation split
+val_ratio: 0.05
+
+# =============================================================================
+# Training Hyperparameters - Multi-GPU Optimized
+# =============================================================================
+# Learning rate (scale with effective batch size)
+learning_rate: 2.0e-5
+
+# Epochs and batch size
+# Per-GPU batch size x num_GPUs x gradient_accumulation = effective batch
+# Example: 4 x 8 x 2 = 64 effective batch size
+num_train_epochs: 3
+per_device_train_batch_size: 4      # Per GPU (conservative for 80GB H100/H200)
+per_device_eval_batch_size: 4
+gradient_accumulation_steps: 2      # Effective batch = 4 * 8 * 2 = 64
+
+# Optimizer
+optim: adamw_torch
+weight_decay: 0.01
+
+# Learning rate schedule
+warmup_ratio: 0.1
+lr_scheduler_type: cosine
+
+# Sequence length
+cutoff_len: 2048
+
+# =============================================================================
+# Precision and Memory
+# =============================================================================
+bf16: true
+fp16: false
+gradient_checkpointing: true
+
+# DeepSpeed (optional - uncomment to enable)
+# deepspeed: configs/deepspeed_config.json
+
+# =============================================================================
+# Logging and Saving
+# =============================================================================
+output_dir: ./outputs/spatial_linking_sft_multi_gpu
+logging_steps: 10
+
+# Checkpoint saving for resume capability
+save_strategy: steps
+save_steps: 50            # Save every 50 steps
+save_total_limit: 3       # Keep only last 3 checkpoints
+
+eval_strategy: epoch
+
+# =============================================================================
+# WandB Configuration
+# =============================================================================
+report_to: wandb
+wandb_project: spatial-linking-hoi
+run_name: spatial_linking_lora_sft_multi_gpu
+
+# =============================================================================
+# Distributed Training Options
+# =============================================================================
+# Data loading
+dataloader_num_workers: 4
+dataloader_pin_memory: true
+
+# For FSDP (alternative to DeepSpeed)
+# fsdp: "full_shard auto_wrap"
+# fsdp_config:
+#   fsdp_transformer_layer_cls_to_wrap: "Qwen2VLDecoderLayer"
+
+# Preprocessing
+preprocessing_num_workers: 8
+
+# Seed for reproducibility
+seed: 42
+
+# Remove unused columns (important for VLM training)
+remove_unused_columns: false
+
+# DDP settings
+ddp_find_unused_parameters: false
+ddp_bucket_cap_mb: 25

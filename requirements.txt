@@ -1,0 +1,31 @@
+# Core ML Libraries
+torch>=2.0.0
+transformers>=4.45.0
+peft>=0.10.0
+trl>=0.10.0
+datasets>=2.14.0
+
+# Vision-Language Model Support
+qwen-vl-utils>=0.0.1
+Pillow>=9.0.0
+
+# Evaluation Metrics
+bert_score>=0.3.13
+numpy>=1.24.0
+
+# Experiment Tracking
+wandb>=0.15.0
+
+# Configuration
+pyyaml>=6.0
+
+# Utilities
+tqdm>=4.65.0
+
+# Visualization (for attention interpretability)
+matplotlib>=3.7.0
+scipy>=1.10.0
+
+# Optional but recommended
+accelerate>=0.25.0
+bitsandbytes>=0.41.0  # For quantization (optional)
