@@ -203,9 +203,34 @@ class SpatialLinkingModule(nn.Module):
                     all_attention_info.append(batch_attention_info)
                 continue
             image_start_idx = image_positions[0].item()
+            num_image_patches = len(image_positions)
             
             # Get grid dimensions for this batch item (assume first image)
             grid_thw = image_grid_thw[0] if image_grid_thw.shape[0] > 0 else image_grid_thw
+            T, H, W = grid_thw.tolist() if torch.is_tensor(grid_thw) else grid_thw
+            
+            # Compute actual grid dimensions from number of patches
+            # If grid_thw says [1, 26, 40] = 1040 patches but we only have 260,
+            # compute actual H and W that match the number of patches
+            expected_patches = int(T) * int(H) * int(W)
+            if expected_patches != num_image_patches:
+                # Recompute grid dimensions to match actual patch count
+                # Try to preserve aspect ratio if possible
+                actual_HW = num_image_patches // int(T)
+                # Find factors close to original H/W ratio
+                ratio = H / W if W > 0 else 1.0
+                # Find best factorization
+                best_H, best_W = H, W
+                min_diff = float('inf')
+                for h in range(1, int(actual_HW ** 0.5) + 1):
+                    if actual_HW % h == 0:
+                        w = actual_HW // h
+                        diff = abs((h / w) - ratio) if w > 0 else float('inf')
+                        if diff < min_diff:
+                            min_diff = diff
+                            best_H, best_W = h, w
+                H, W = best_H, best_W
+                grid_thw = torch.tensor([T, H, W], dtype=grid_thw.dtype, device=grid_thw.device) if torch.is_tensor(grid_thw) else [T, H, W]
             
             # Process each <|box_end|> with its corresponding bbox
             num_boxes = min(len(box_end_positions), refer_boxes[b].shape[0])
@@ -222,9 +247,17 @@ class SpatialLinkingModule(nn.Module):
                     bbox, grid_thw, image_start_idx, inputs_embeds.device
                 )
                 
-                # Filter valid indices
+                # Filter valid indices: must be in sequence AND actually be an image patch
+                # First filter by sequence bounds
                 valid_mask = (patch_indices >= 0) & (patch_indices < seq_len)
-                patch_indices = patch_indices[valid_mask]
+                patch_indices_in_bounds = patch_indices[valid_mask]
+                
+                # Then filter to only include indices that are actually image patches
+                if len(patch_indices_in_bounds) > 0:
+                    image_patch_mask = image_mask[b][patch_indices_in_bounds].bool()
+                    patch_indices = patch_indices_in_bounds[image_patch_mask]
+                else:
+                    patch_indices = patch_indices_in_bounds
                 
                 if len(patch_indices) == 0:
                     continue

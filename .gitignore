@@ -2,5 +2,6 @@ wandb/
 outputs/
 eval_results/
 __pycache__/
+attention_comparison/
 .DS_Store
 .env

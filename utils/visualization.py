@@ -57,21 +57,36 @@ def create_attention_heatmap(
     """
     T, H, W = grid_thw.tolist() if torch.is_tensor(grid_thw) else grid_thw
     
-    # Reduce attention across heads
-    attn = attention_weights.squeeze(0).squeeze(2)  # [num_heads, num_patches]
+    # Handle different attention tensor shapes
+    attn = attention_weights
     
-    if head_reduction == 'mean':
-        attn = attn.mean(dim=0)  # [num_patches]
-    elif head_reduction == 'max':
-        attn = attn.max(dim=0).values  # [num_patches]
-    elif isinstance(head_reduction, int):
-        attn = attn[head_reduction]  # [num_patches]
-    else:
-        attn = attn.mean(dim=0)
+    if attn.dim() == 4:
+        # [1, num_heads, 1, num_patches] -> [num_heads, num_patches]
+        attn = attn.squeeze(0).squeeze(1)
+    elif attn.dim() == 3:
+        # [num_heads, 1, num_patches] or [1, num_heads, num_patches]
+        if attn.shape[1] == 1:
+            attn = attn.squeeze(1)  # [num_heads, num_patches]
+        else:
+            attn = attn.squeeze(0)  # [num_heads, num_patches]
+    # Now attn should be [num_heads, num_patches] or [num_patches]
     
-    # Convert to numpy
-    attn = attn.numpy() if torch.is_tensor(attn) else attn
-    patch_indices = patch_indices.numpy() if torch.is_tensor(patch_indices) else patch_indices
+    # Reduce across heads if needed
+    if attn.dim() == 2:
+        if head_reduction == 'mean':
+            attn = attn.mean(dim=0)  # [num_patches]
+        elif head_reduction == 'max':
+            attn = attn.max(dim=0).values  # [num_patches]
+        elif isinstance(head_reduction, int):
+            attn = attn[head_reduction]  # [num_patches]
+        else:
+            attn = attn.mean(dim=0)
+    # attn is now [num_patches]
+    
+    # Convert to numpy (handle bfloat16 which doesn't support direct numpy conversion)
+    if torch.is_tensor(attn):
+        attn = attn.float().cpu().numpy()
+    patch_indices = patch_indices.cpu().numpy() if torch.is_tensor(patch_indices) else patch_indices
     
     # Create full heatmap
     heatmap = np.zeros((int(H), int(W)), dtype=np.float32)

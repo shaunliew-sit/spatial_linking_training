@@ -543,26 +543,96 @@ def load_model(model_path: str, device: str = "cuda", model_type: str = "auto"):
     if model_type == "spatial_linking":
         # Load SpatialLinkingInteractionModel
         logger.info("Loading SpatialLinkingInteractionModel...")
-        model = SpatialLinkingInteractionModel.from_pretrained(
-            model_path,
-            torch_dtype=torch.bfloat16,
-            trust_remote_code=True,
-            device_map="auto",
-        )
+        
+        # Check if PEFT adapters exist
+        adapter_config_path = os.path.join(model_path, "adapter_config.json")
+        has_peft = os.path.exists(adapter_config_path)
+        
+        # Determine evaluation device (use single GPU to avoid device placement issues)
+        eval_device = device if isinstance(device, str) and device.startswith("cuda:") else "cuda:0"
+        
+        if has_peft:
+            # Load base model first, then PEFT adapters
+            logger.info("  Detected PEFT adapters - loading base model first...")
+            # Read adapter config to get base model
+            with open(adapter_config_path, 'r') as f:
+                adapter_config = json.load(f)
+            base_model_name = adapter_config.get("base_model_name_or_path", "Qwen/Qwen3-VL-8B-Instruct")
+            
+            # Load base SpatialLinkingInteractionModel on single GPU
+            base_model = SpatialLinkingInteractionModel.from_pretrained(
+                base_model_name,
+                torch_dtype=torch.bfloat16,
+                trust_remote_code=True,
+                device_map=eval_device,
+            )
+            
+            # Load PEFT adapters
+            logger.info("  Loading PEFT LoRA adapters...")
+            # PeftModel.from_pretrained inherits device from base_model
+            model = PeftModel.from_pretrained(base_model, model_path)
+            logger.info("  PEFT adapters loaded successfully")
+        else:
+            # No PEFT - load directly
+            logger.info(f"  Loading model on CPU, will move to {eval_device}...")
+            model = SpatialLinkingInteractionModel.from_pretrained(
+                model_path,
+                torch_dtype=torch.bfloat16,
+                trust_remote_code=True,
+                device_map=None,  # Disable device_map to avoid distribution
+            )
+            # Move model to target device
+            target_device = torch.device(eval_device)
+            model = model.to(target_device)
         
         # Load spatial linking weights if available
         spatial_linking_path = os.path.join(model_path, "spatial_linking.pt")
         if os.path.exists(spatial_linking_path):
             logger.info(f"Loading spatial linking weights from {spatial_linking_path}")
             spatial_linking_state = torch.load(spatial_linking_path, map_location="cpu")
-            model.spatial_linking.load_state_dict(spatial_linking_state)
+            
+            # Handle PEFT-wrapped model structure
+            if has_peft:
+                # PEFT model: spatial_linking is at model.base_model.model.spatial_linking
+                if hasattr(model, 'base_model') and hasattr(model.base_model, 'model'):
+                    if hasattr(model.base_model.model, 'spatial_linking'):
+                        model.base_model.model.spatial_linking.load_state_dict(spatial_linking_state)
+                    else:
+                        logger.warning("Could not find spatial_linking in PEFT model structure")
+                elif hasattr(model, 'base_model') and hasattr(model.base_model, 'spatial_linking'):
+                    model.base_model.spatial_linking.load_state_dict(spatial_linking_state)
+                else:
+                    logger.warning("Could not find spatial_linking module in PEFT model")
+            else:
+                # Non-PEFT model: spatial_linking is directly on model
+                model.spatial_linking.load_state_dict(spatial_linking_state)
+            
             logger.info(f"  Loaded keys: {list(spatial_linking_state.keys())}")
         else:
             logger.warning(f"Spatial linking weights not found at {spatial_linking_path}")
             logger.warning("  The spatial_linking module will use random initialization!")
         
+        # Ensure entire model is on single GPU after all loading
+        # Check if model is distributed across multiple devices
+        model_devices = {str(p.device) for p in model.parameters()}
+        if len(model_devices) > 1:
+            logger.warning(f"Model distributed across devices: {model_devices}. Consolidating to {eval_device}...")
+            target_device = torch.device(eval_device)
+            # Move entire model to single device
+            model = model.to(target_device)
+            logger.info(f"Model consolidated to {target_device}")
+        else:
+            logger.info(f"Model on device: {list(model_devices)[0]}")
+        
         # Set box token IDs
-        model.set_box_token_ids(processor.tokenizer)
+        # Handle PEFT-wrapped model structure
+        if has_peft:
+            if hasattr(model, 'base_model') and hasattr(model.base_model, 'model'):
+                model.base_model.model.set_box_token_ids(processor.tokenizer)
+            elif hasattr(model, 'base_model'):
+                model.base_model.set_box_token_ids(processor.tokenizer)
+        else:
+            model.set_box_token_ids(processor.tokenizer)
         
     else:
         # Load base Qwen3-VL with LoRA adapters (LLaMA Factory style)
@@ -591,11 +661,13 @@ def load_model(model_path: str, device: str = "cuda", model_type: str = "auto"):
         except ImportError:
             # Fallback for older transformers versions
             from transformers import AutoModelForCausalLM
+            # Use single GPU for evaluation
+            eval_device = device if isinstance(device, str) and device.startswith("cuda:") else "cuda:0"
             base_model = AutoModelForCausalLM.from_pretrained(
                 base_model_name,
                 torch_dtype=torch.bfloat16,
                 trust_remote_code=True,
-                device_map="auto",
+                device_map=eval_device,
             )
         
         # Load LoRA adapter
@@ -641,11 +713,28 @@ def get_image_path(file_name: str, image_base_dir: str) -> str:
 # PROMPT CONSTRUCTION (matching training format)
 # =============================================================================
 
-def create_referring_prompt(person_box: List[int], object_box: List[int]) -> str:
+def create_referring_prompt(person_box: List[int], object_box: List[int], interaction_box: Optional[List[int]] = None) -> str:
     """Create referring task prompt matching training format (text-only part)."""
+    # Format boxes with <|box_start|> and <|box_end|> tokens for spatial linking
+    # Format: <|box_start|>{"bbox_2d": [x1, y1, x2, y2], "label": "person"}<|box_end|>
+    person_box_str = f'{{"bbox_2d": {person_box}, "label": "person"}}'
+    object_box_str = f'{{"bbox_2d": {object_box}, "label": "object"}}'
+    
+    # Compute interaction box if not provided
+    if interaction_box is None:
+        interaction_box = [
+            min(person_box[0], object_box[0]),
+            min(person_box[1], object_box[1]),
+            max(person_box[2], object_box[2]),
+            max(person_box[3], object_box[3])
+        ]
+    interaction_box_str = f'{{"bbox_2d": {interaction_box}, "label": "interaction"}}'
+    
     return (
         f"Question: What action is the person performing with the object?\n"
-        f"The person is located at {person_box} and the object is at {object_box}.\n"
+        f"The first region <|box_start|>{person_box_str}<|box_end|> contains a PERSON. "
+        f"The second region <|box_start|>{object_box_str}<|box_end|> contains an OBJECT. "
+        f"The interaction region <|box_start|>{interaction_box_str}<|box_end|> shows their interaction.\n"
         f"Respond with ONLY the action phrase in format: \"{{verb}} {{object}}\" "
         f"(e.g., \"riding bicycle\", \"holding cup\"). Use base verb form, no articles.\n"
         f"Think in the mind first, and then decide whether to call tools one or more times "
@@ -654,9 +743,9 @@ def create_referring_prompt(person_box: List[int], object_box: List[int]) -> str
     )
 
 
-def create_referring_prompt_with_image(person_box: List[int], object_box: List[int], image) -> List[dict]:
+def create_referring_prompt_with_image(person_box: List[int], object_box: List[int], image, interaction_box: Optional[List[int]] = None) -> List[dict]:
     """Create referring task prompt with image as structured content for Qwen3-VL."""
-    text_content = create_referring_prompt(person_box, object_box)
+    text_content = create_referring_prompt(person_box, object_box, interaction_box)
     return [
         {"type": "image", "image": image},
         {"type": "text", "text": text_content}
@@ -693,6 +782,8 @@ def normalize_bbox_to_1000(bbox: List, width: int, height: int) -> List[int]:
     This matches the training data format where all coordinates are
     normalized to a 1000x1000 grid regardless of actual image size.
     
+    Formula from README: x_1000 = round(x_px / (W - 1) * 1000)
+    
     Args:
         bbox: Bounding box in pixel coordinates [x1, y1, x2, y2]
         width: Image width in pixels
@@ -703,10 +794,10 @@ def normalize_bbox_to_1000(bbox: List, width: int, height: int) -> List[int]:
     """
     x1, y1, x2, y2 = bbox
     return [
-        int(x1 * 1000 / width),
-        int(y1 * 1000 / height),
-        int(x2 * 1000 / width),
-        int(y2 * 1000 / height)
+        round(x1 / (width - 1) * 1000),
+        round(y1 / (height - 1) * 1000),
+        round(x2 / (width - 1) * 1000),
+        round(y2 / (height - 1) * 1000)
     ]
 
 
@@ -796,7 +887,13 @@ def run_agent_loop(
             truncation=True,
             max_length=4096,
         )
-        inputs = {k: v.to(device) for k, v in inputs.items()}
+        # Move inputs to model device
+        # Handle both string device ("cuda:0") and torch.device
+        if isinstance(device, str):
+            device_obj = torch.device(device)
+        else:
+            device_obj = device
+        inputs = {k: v.to(device_obj) for k, v in inputs.items()}
         
         # Generate
         with torch.no_grad():
@@ -1213,23 +1310,77 @@ def parse_box_predictions(text: str, img_shape: Tuple[int, int] = (1000, 1000)) 
                                     'object_box': object_bbox
                                 })
                     
-                    # Format 2: bbox_2d with labels (alternating person/object)
+                    # Format 2: bbox_2d with labels (person/object pairs)
                     elif isinstance(first_item, dict) and 'bbox_2d' in first_item:
-                        for i in range(0, len(parsed) - 1, 2):
-                            person_det = parsed[i]
-                            object_det = parsed[i + 1] if i + 1 < len(parsed) else None
+                        # Group by labels: persons and objects
+                        persons = []
+                        objects = []
+                        
+                        for det in parsed:
+                            if not isinstance(det, dict):
+                                continue
+                            label = det.get('label', '').lower()
+                            bbox = det.get('bbox_2d', [])
                             
-                            if object_det is None:
+                            if len(bbox) != 4:
                                 continue
                             
-                            person_bbox = person_det.get('bbox_2d', [])
-                            object_bbox = object_det.get('bbox_2d', [])
-                            
-                            if len(person_bbox) == 4 and len(object_bbox) == 4:
-                                pairs.append({
-                                    'person_box': person_bbox,
-                                    'object_box': object_bbox
-                                })
+                            # Check if it's a person (common person labels)
+                            if 'person' in label or label.startswith('person'):
+                                persons.append(bbox)
+                            else:
+                                # Everything else is an object
+                                objects.append(bbox)
+                        
+                        # Pair each person with each object (or use alternating if that's the format)
+                        # If we have equal numbers, use alternating format (original behavior)
+                        if len(persons) > 0 and len(objects) > 0:
+                            if len(persons) == len(objects):
+                                # Alternating format: person, object, person, object, ...
+                                for i in range(min(len(persons), len(objects))):
+                                    pairs.append({
+                                        'person_box': persons[i],
+                                        'object_box': objects[i]
+                                    })
+                            else:
+                                # Multiple persons or objects: pair each person with each object
+                                # For now, pair first person with first object, etc.
+                                for i in range(min(len(persons), len(objects))):
+                                    pairs.append({
+                                        'person_box': persons[i],
+                                        'object_box': objects[i]
+                                    })
+                                # If more objects than persons, pair last person with remaining objects
+                                if len(objects) > len(persons) and len(persons) > 0:
+                                    for i in range(len(persons), len(objects)):
+                                        pairs.append({
+                                            'person_box': persons[-1],  # Use last person
+                                            'object_box': objects[i]
+                                        })
+                                # If more persons than objects, pair remaining persons with last object
+                                elif len(persons) > len(objects) and len(objects) > 0:
+                                    for i in range(len(objects), len(persons)):
+                                        pairs.append({
+                                            'person_box': persons[i],
+                                            'object_box': objects[-1]  # Use last object
+                                        })
+                        # Fallback: if no clear person/object distinction, try alternating
+                        elif len(parsed) >= 2:
+                            for i in range(0, len(parsed) - 1, 2):
+                                person_det = parsed[i]
+                                object_det = parsed[i + 1] if i + 1 < len(parsed) else None
+                                
+                                if object_det is None:
+                                    continue
+                                
+                                person_bbox = person_det.get('bbox_2d', [])
+                                object_bbox = object_det.get('bbox_2d', [])
+                                
+                                if len(person_bbox) == 4 and len(object_bbox) == 4:
+                                    pairs.append({
+                                        'person_box': person_bbox,
+                                        'object_box': object_bbox
+                                    })
     except (json.JSONDecodeError, Exception) as e:
         logger.debug(f"JSON parsing failed: {e}")
     
@@ -1390,8 +1541,8 @@ def evaluate_referring_task(
             ]
             
             # Create prompt with structured image content for Qwen3-VL
-            user_prompt = create_referring_prompt(person_box, object_box)
-            user_content = create_referring_prompt_with_image(person_box, object_box, image)
+            user_prompt = create_referring_prompt(person_box, object_box, interaction_box)
+            user_content = create_referring_prompt_with_image(person_box, object_box, image, interaction_box)
             
             messages = [
                 {"role": "system", "content": SYSTEM_PROMPT},
@@ -1411,6 +1562,7 @@ def evaluate_referring_task(
                 truncation=True,
                 max_length=4096,
             )
+            # Move inputs to model device
             inputs = {k: v.to(device) for k, v in inputs.items()}
             
             # Prepare refer_boxes for spatial linking
@@ -1419,15 +1571,19 @@ def evaluate_referring_task(
                 dtype=torch.float32
             ).unsqueeze(0)  # [1, 3, 4]
             
+            # Move refer_boxes to same device as inputs
+            refer_boxes_tensor = refer_boxes_tensor.to(device)
+            
             # Generate with spatial attention output if visualizing
             with torch.no_grad():
                 # For visualization, we need to do a forward pass first
                 if has_viz and idx < 10:  # Only visualize first 10
                     try:
                         # Forward pass to get attention weights
+                        refer_boxes_list = [refer_boxes_tensor.squeeze(0).to(device)]
                         _ = model(
                             **inputs,
-                            refer_boxes=[refer_boxes_tensor.squeeze(0).to(device)],
+                            refer_boxes=refer_boxes_list,
                             output_spatial_attentions=True,
                         )
                         attention_info = model.get_spatial_attention_weights()
@@ -1470,9 +1626,11 @@ def evaluate_referring_task(
             
             if first_components['has_tool_call'] and first_components['tool_calls']:
                 # Run multi-turn with tool execution
+                # Convert device to string for run_agent_loop
+                device_str = str(device)
                 agent_result = run_agent_loop(
                     model, processor, image, user_prompt, SYSTEM_PROMPT,
-                    device, max_turns=3, max_new_tokens=256
+                    device_str, max_turns=3, max_new_tokens=256
                 )
                 generated = agent_result['final_response']
                 all_tool_calls = agent_result['tool_calls']
@@ -1635,7 +1793,9 @@ def evaluate_grounding_task(
                 truncation=True,
                 max_length=4096,
             )
-            inputs = {k: v.to(device) for k, v in inputs.items()}
+            # Only move to device if single-GPU model
+            if device is not None:
+                inputs = {k: v.to(device) for k, v in inputs.items()}
             
             # Generate
             with torch.no_grad():
@@ -2119,17 +2279,74 @@ def format_attention_for_viz(
         patch_size = 14
         grid_thw = [1, img_height // patch_size, img_width // patch_size]
     
+    # Handle case where attention_weights is already a list of dicts (from spatial_linking)
+    if len(attention_weights) > 0 and isinstance(attention_weights[0], dict):
+        # attention_weights is already in the correct format from spatial_linking.py
+        # Each dict has: 'attention_weights', 'bbox', 'patch_indices', 'box_type', 'box_end_position', 'grid_thw'
+        for attn_info in attention_weights:
+            if attn_info is None:
+                continue
+            
+            # Extract attention tensor and ensure it's on CPU
+            attn_tensor = attn_info.get('attention_weights')
+            if attn_tensor is None:
+                continue
+            if torch.is_tensor(attn_tensor):
+                attn_tensor = attn_tensor.detach().cpu()
+            
+            # Get patch indices from the dict
+            patch_indices = attn_info.get('patch_indices')
+            if patch_indices is not None and torch.is_tensor(patch_indices):
+                patch_indices = patch_indices.detach().cpu()
+            
+            # Get bbox from the dict
+            bbox = attn_info.get('bbox')
+            if bbox is not None and torch.is_tensor(bbox):
+                bbox = bbox.detach().cpu().tolist()
+            
+            # Get box type
+            box_type = attn_info.get('box_type', 'unknown')
+            
+            # Get grid_thw from the dict if available
+            info_grid_thw = attn_info.get('grid_thw')
+            if info_grid_thw is not None and torch.is_tensor(info_grid_thw):
+                info_grid_thw = info_grid_thw.tolist()
+            else:
+                info_grid_thw = grid_thw
+            
+            # Keep attention tensor as-is for visualization functions to handle
+            # Expected format: [1, num_heads, 1, num_patches] or compatible
+            # Don't pre-process here - let create_attention_heatmap handle it
+            
+            attention_info_list.append({
+                'attention_weights': attn_tensor,
+                'bbox': bbox,
+                'patch_indices': patch_indices,
+                'box_type': box_type,
+                'grid_thw': info_grid_thw,
+            })
+        
+        return attention_info_list
+    
+    # Original logic for raw tensor attention weights
     for i, (box, box_type) in enumerate(zip(boxes[:len(attention_weights)], box_types)):
         if i >= len(attention_weights):
             break
         
         attn = attention_weights[i]
+        
         if attn is None:
             continue
         
         # Ensure attention is on CPU
         if torch.is_tensor(attn):
             attn = attn.detach().cpu()
+        elif isinstance(attn, (list, tuple)):
+            # Convert list/tuple to tensor
+            try:
+                attn = torch.tensor(attn, dtype=torch.float32)
+            except Exception as e:
+                continue
         
         # Normalize box to [0, 1]
         norm_box = [
@@ -2143,8 +2360,17 @@ def format_attention_for_viz(
         num_patches = int(grid_thw[1] * grid_thw[2])
         patch_indices = torch.arange(num_patches)
         
+        # Handle different tensor dimensions
+        if torch.is_tensor(attn):
+            if attn.dim() == 3:
+                attn_formatted = attn.unsqueeze(0)
+            else:
+                attn_formatted = attn
+        else:
+            continue
+        
         attention_info_list.append({
-            'attention_weights': attn.unsqueeze(0) if attn.dim() == 3 else attn,
+            'attention_weights': attn_formatted,
             'bbox': torch.tensor(norm_box),
             'box_type': box_type,
             'grid_thw': torch.tensor(grid_thw),
@@ -2217,7 +2443,11 @@ def print_response_statistics(detailed_results: List[Dict]):
     has_thinking = sum(1 for r in detailed_results if r.get('thinking'))
     has_tool_call = sum(1 for r in detailed_results if r.get('has_tool_call'))
     has_answer = sum(1 for r in detailed_results if r.get('answer_tag'))
-    empty_pred = sum(1 for r in detailed_results if not r.get('predicted'))
+    # Check for empty predictions - handle both referring ('predicted') and grounding ('predicted_pairs')
+    empty_pred = sum(1 for r in detailed_results if (
+        (r.get('predicted') is None or r.get('predicted') == '') and 
+        (not r.get('predicted_pairs') or len(r.get('predicted_pairs', [])) == 0)
+    ))
     
     print("=" * 70)
     print(" Response Pattern Statistics")
@@ -2407,14 +2637,18 @@ def save_results(
         f.write("=" * 80 + "\n")
         
         total = len(detailed_results)
-        has_think = sum(1 for r in detailed_results if r.get('thinking'))
-        has_tool = sum(1 for r in detailed_results if r.get('has_tool_call'))
-        has_answer = sum(1 for r in detailed_results if r.get('answer_tag'))
-        
-        f.write(f"  Total samples: {total}\n")
-        f.write(f"  Has <think>: {has_think} ({100*has_think/total:.1f}%)\n")
-        f.write(f"  Has <tool_call>: {has_tool} ({100*has_tool/total:.1f}%)\n")
-        f.write(f"  Has <answer>: {has_answer} ({100*has_answer/total:.1f}%)\n")
+        if total > 0:
+            has_think = sum(1 for r in detailed_results if r.get('thinking'))
+            has_tool = sum(1 for r in detailed_results if r.get('has_tool_call'))
+            has_answer = sum(1 for r in detailed_results if r.get('answer_tag'))
+            
+            f.write(f"  Total samples: {total}\n")
+            f.write(f"  Has <think>: {has_think} ({100*has_think/total:.1f}%)\n")
+            f.write(f"  Has <tool_call>: {has_tool} ({100*has_tool/total:.1f}%)\n")
+            f.write(f"  Has <answer>: {has_answer} ({100*has_answer/total:.1f}%)\n")
+        else:
+            f.write(f"  Total samples: 0\n")
+            f.write(f"  No samples processed successfully\n")
         
         if has_tool > 0:
             tool_counts = {}
