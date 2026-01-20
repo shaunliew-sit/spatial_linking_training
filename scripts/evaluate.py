@@ -37,12 +37,16 @@ import json
 import re
 import argparse
 import logging
+import base64
+import io
+import uuid
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Union
 from datetime import datetime
 from tqdm import tqdm
 
 import torch
+import requests
 from transformers import AutoProcessor
 from PIL import Image
 
@@ -72,6 +76,405 @@ For the function call, return a json object with function name and arguments wit
 <tool_call>
 {"name": <function-name>, "arguments": <args-json-object>}
 </tool_call>"""
+
+
+# =============================================================================
+# ZOOM IN TOOL (Real Tool for Multi-turn Evaluation)
+# =============================================================================
+
+class ZoomInTool:
+    """
+    Real zoom_in tool for HOI evaluation.
+    Handles 1000x1000 normalized coordinates matching Qwen3-VL training format.
+    Manages trajectory state across multi-turn conversations.
+    Tracks zoom transforms for coordinate conversion back to original image space.
+    """
+    
+    def __init__(self, padding: Tuple[float, float] = (0.1, 0.1)):
+        """
+        Args:
+            padding: Fractional padding to add around crops (x_pad, y_pad)
+        """
+        self.env_cache: Dict[str, Dict] = {}
+        self.padding = padding
+    
+    def _load_env(self, trajectory_id: str) -> Dict:
+        """Load or create environment for trajectory."""
+        if trajectory_id not in self.env_cache:
+            self.env_cache[trajectory_id] = {
+                'images': [],
+                'turns': 0,
+                'zoom_transforms': [],  # List of (x_offset, y_offset, scale_x, scale_y) for each zoom
+                'original_size': None,  # (width, height) of original image
+            }
+        return self.env_cache[trajectory_id]
+    
+    def init_trajectory(self, trajectory_id: str, image: Image.Image):
+        """Initialize a new trajectory with the original image."""
+        env = self._load_env(trajectory_id)
+        if isinstance(image, Image.Image):
+            env['images'] = [image.copy()]
+            env['original_size'] = image.size  # (width, height)
+        else:
+            img = Image.open(image).convert('RGB')
+            env['images'] = [img]
+            env['original_size'] = img.size
+        env['zoom_transforms'] = []  # Reset transforms
+    
+    def delete_trajectory(self, trajectory_id: str):
+        """Cleanup trajectory state."""
+        self.env_cache.pop(trajectory_id, None)
+    
+    def get_cumulative_transform(self, trajectory_id: str) -> Tuple[float, float, float, float]:
+        """
+        Get cumulative transform from current view to original image coordinates.
+        
+        Returns:
+            (x_offset, y_offset, scale_x, scale_y) where:
+            - original_x = (current_x / 1000 * scale_x + x_offset) * 1000
+            - original_y = (current_y / 1000 * scale_y + y_offset) * 1000
+        """
+        env = self._load_env(trajectory_id)
+        transforms = env.get('zoom_transforms', [])
+        
+        if not transforms:
+            return (0.0, 0.0, 1.0, 1.0)
+        
+        # Compose all transforms
+        x_off, y_off, scale_x, scale_y = 0.0, 0.0, 1.0, 1.0
+        
+        for tx, ty, sx, sy in transforms:
+            # Apply this transform on top of accumulated transform
+            x_off = x_off + tx * scale_x
+            y_off = y_off + ty * scale_y
+            scale_x = scale_x * sx
+            scale_y = scale_y * sy
+        
+        return (x_off, y_off, scale_x, scale_y)
+    
+    def transform_box_to_original(self, trajectory_id: str, box: List[float]) -> List[int]:
+        """
+        Transform a box from current view coordinates to original image coordinates.
+        
+        Args:
+            trajectory_id: Trajectory ID
+            box: Box in current view's 1000x1000 coordinates [x1, y1, x2, y2]
+            
+        Returns:
+            Box in original image's 1000x1000 coordinates
+        """
+        x_off, y_off, scale_x, scale_y = self.get_cumulative_transform(trajectory_id)
+        
+        x1, y1, x2, y2 = [float(c) / 1000.0 for c in box]
+        
+        # Transform back to original coordinates
+        orig_x1 = (x1 * scale_x + x_off) * 1000
+        orig_y1 = (y1 * scale_y + y_off) * 1000
+        orig_x2 = (x2 * scale_x + x_off) * 1000
+        orig_y2 = (y2 * scale_y + y_off) * 1000
+        
+        return [int(orig_x1), int(orig_y1), int(orig_x2), int(orig_y2)]
+    
+    def parse_tool_call(self, response: str) -> Tuple[Optional[Dict], bool]:
+        """Parse <tool_call>...</tool_call> from model response."""
+        pattern = r'<tool_call>\s*(\{.*?\})\s*</tool_call>'
+        match = re.search(pattern, response, re.DOTALL)
+        if not match:
+            return None, False
+        try:
+            call = json.loads(match.group(1))
+            if call.get('name') == 'zoom_in':
+                return call, True
+            return None, False
+        except json.JSONDecodeError:
+            return None, False
+    
+    def execute(
+        self,
+        trajectory_id: str,
+        response: str
+    ) -> Tuple[Optional[Image.Image], str, bool]:
+        """
+        Execute zoom_in based on model response.
+        
+        Args:
+            trajectory_id: Unique conversation ID
+            response: Full model response containing <tool_call>
+            
+        Returns:
+            (cropped_image, observation_text, is_valid)
+            - cropped_image: PIL Image if successful, None otherwise
+            - observation_text: Description of result
+            - is_valid: Whether execution succeeded
+        """
+        env = self._load_env(trajectory_id)
+        
+        # Parse tool call
+        parsed, valid = self.parse_tool_call(response)
+        if not valid:
+            return None, "No valid zoom_in tool call found.", False
+        
+        args = parsed.get('arguments', {})
+        bbox_2d = args.get('bbox_2d', args.get('bbox', []))
+        target_image = args.get('target_image', 1)
+        
+        # Validate
+        try:
+            target_image = int(target_image)
+        except (ValueError, TypeError):
+            target_image = 1
+        
+        if not isinstance(bbox_2d, list) or len(bbox_2d) != 4:
+            return None, "Invalid bbox_2d: expected [x1, y1, x2, y2]", False
+        
+        if target_image < 1 or target_image > len(env['images']):
+            return None, f"Invalid target_image: {target_image}. Have {len(env['images'])} images.", False
+        
+        # Get source image
+        image = env['images'][target_image - 1]
+        img_w, img_h = image.size
+        
+        # Convert 1000x1000 normalized to pixel coordinates
+        x1, y1, x2, y2 = [float(c) for c in bbox_2d]
+        
+        # Handle 1000-scale normalization (training format)
+        x1_norm = x1 / 1000.0
+        y1_norm = y1 / 1000.0
+        x2_norm = x2 / 1000.0
+        y2_norm = y2 / 1000.0
+        
+        # Add padding
+        pad_x, pad_y = self.padding
+        x1_norm = max(0, x1_norm - pad_x)
+        y1_norm = max(0, y1_norm - pad_y)
+        x2_norm = min(1, x2_norm + pad_x)
+        y2_norm = min(1, y2_norm + pad_y)
+        
+        # Convert to pixels
+        px1 = int(x1_norm * img_w)
+        py1 = int(y1_norm * img_h)
+        px2 = int(x2_norm * img_w)
+        py2 = int(y2_norm * img_h)
+        
+        # Validate crop region
+        if px2 <= px1 or py2 <= py1:
+            return None, f"Invalid crop region after conversion: [{px1},{py1},{px2},{py2}]", False
+        
+        # Crop
+        try:
+            cropped = image.crop((px1, py1, px2, py2))
+            if cropped.mode != 'RGB':
+                cropped = cropped.convert('RGB')
+            
+            # Track the zoom transform for coordinate conversion
+            # The transform maps from cropped image coords (0-1) to source image coords (0-1)
+            # cropped coord * scale + offset = source coord
+            crop_w_px = px2 - px1
+            crop_h_px = py2 - py1
+            
+            # Offset in normalized coords (relative to current view, not original)
+            # We need to track cumulative transforms
+            x_offset = px1 / img_w  # offset in source image normalized coords
+            y_offset = py1 / img_h
+            scale_x = crop_w_px / img_w  # scale factor
+            scale_y = crop_h_px / img_h
+            
+            env['zoom_transforms'].append((x_offset, y_offset, scale_x, scale_y))
+            
+            # Add to trajectory
+            env['images'].append(cropped)
+            env['turns'] += 1
+            
+            crop_w, crop_h = cropped.size
+            obs = f"Zoomed into region {[int(c) for c in bbox_2d]}. Now viewing {crop_w}x{crop_h} cropped area."
+            
+            return cropped, obs, True
+            
+        except Exception as e:
+            return None, f"Crop failed: {str(e)}", False
+    
+    def get_all_images(self, trajectory_id: str) -> List[Image.Image]:
+        """Get all images accumulated in trajectory."""
+        env = self._load_env(trajectory_id)
+        return env.get('images', [])
+
+
+# =============================================================================
+# VLLM CLIENT FUNCTIONS
+# =============================================================================
+
+def encode_image_to_base64(image: Image.Image, max_size: int = 1024, quality: int = 85) -> str:
+    """
+    Encode PIL Image to base64 string for vLLM API.
+    
+    Args:
+        image: PIL Image to encode
+        max_size: Maximum dimension (will resize if larger)
+        quality: JPEG quality (1-100)
+    
+    Returns:
+        Base64 encoded image string with data URI prefix
+    """
+    # Resize if too large
+    if max(image.size) > max_size:
+        ratio = max_size / max(image.size)
+        new_size = (int(image.size[0] * ratio), int(image.size[1] * ratio))
+        image = image.resize(new_size, Image.Resampling.LANCZOS)
+    
+    # Convert to RGB if needed
+    if image.mode != 'RGB':
+        image = image.convert('RGB')
+    
+    # Encode to base64
+    buffered = io.BytesIO()
+    image.save(buffered, format="JPEG", quality=quality)
+    img_b64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+    
+    return f"data:image/jpeg;base64,{img_b64}"
+
+
+def format_messages_for_vllm(
+    messages: List[Dict], 
+    images: List[Image.Image]
+) -> List[Dict]:
+    """
+    Format messages with images for vLLM's OpenAI-compatible API.
+    
+    Args:
+        messages: List of message dicts with role and content
+        images: List of PIL Images to embed
+    
+    Returns:
+        Formatted messages ready for vLLM API
+    """
+    formatted = []
+    image_idx = 0
+    
+    for msg in messages:
+        role = msg['role']
+        content = msg['content']
+        
+        if role == 'system':
+            formatted.append({'role': 'system', 'content': content})
+        
+        elif role == 'assistant':
+            formatted.append({'role': 'assistant', 'content': content})
+        
+        elif role == 'user':
+            if isinstance(content, list):
+                # Content has structured parts (text + images)
+                parts = []
+                for item in content:
+                    if item.get('type') == 'image' and image_idx < len(images):
+                        img_b64 = encode_image_to_base64(images[image_idx])
+                        parts.append({
+                            'type': 'image_url',
+                            'image_url': {'url': img_b64}
+                        })
+                        image_idx += 1
+                    elif item.get('type') == 'text':
+                        parts.append({'type': 'text', 'text': item['text']})
+                formatted.append({'role': 'user', 'content': parts})
+            else:
+                # Plain text content
+                formatted.append({'role': 'user', 'content': content})
+    
+    return formatted
+
+
+def call_vllm(
+    messages: List[Dict],
+    images: List[Image.Image],
+    endpoint: str,
+    model_name: str,
+    max_tokens: int = 512,
+    temperature: float = 0.7,
+    top_p: float = 0.9,
+    timeout: int = 120,
+) -> str:
+    """
+    Call vLLM server with OpenAI-compatible API.
+    
+    Args:
+        messages: Conversation messages
+        images: Images to include
+        endpoint: vLLM server endpoint (e.g., http://localhost:8000/v1)
+        model_name: Model name registered in vLLM
+        max_tokens: Maximum tokens to generate
+        temperature: Sampling temperature
+        top_p: Top-p sampling
+        timeout: Request timeout in seconds
+    
+    Returns:
+        Generated text response
+    
+    Raises:
+        Exception: If API call fails
+    """
+    # Format messages with images
+    formatted_messages = format_messages_for_vllm(messages, images)
+    
+    # Build request payload
+    payload = {
+        'model': model_name,
+        'messages': formatted_messages,
+        'max_tokens': max_tokens,
+        'temperature': temperature,
+        'top_p': top_p,
+    }
+    
+    # Make API request
+    url = f"{endpoint.rstrip('/')}/chat/completions"
+    headers = {'Content-Type': 'application/json'}
+    
+    try:
+        response = requests.post(
+            url,
+            json=payload,
+            headers=headers,
+            timeout=timeout
+        )
+        response.raise_for_status()
+        
+        result = response.json()
+        return result['choices'][0]['message']['content']
+        
+    except requests.exceptions.Timeout:
+        raise Exception(f"vLLM request timed out after {timeout}s")
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"vLLM API error: {str(e)}")
+    except (KeyError, IndexError) as e:
+        raise Exception(f"Invalid vLLM response format: {str(e)}")
+
+
+def check_vllm_health(endpoint: str, model_name: str) -> bool:
+    """
+    Check if vLLM server is healthy and model is loaded.
+    
+    Args:
+        endpoint: vLLM server endpoint
+        model_name: Expected model name
+    
+    Returns:
+        True if server is healthy and model is available
+    """
+    try:
+        url = f"{endpoint.rstrip('/')}/models"
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        
+        models = response.json()
+        available_models = [m['id'] for m in models.get('data', [])]
+        
+        if model_name in available_models:
+            return True
+        else:
+            logger.warning(f"Model '{model_name}' not found. Available: {available_models}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"vLLM health check failed: {e}")
+        return False
 
 
 # =============================================================================
@@ -478,6 +881,147 @@ def run_agent_loop(
     }
 
 
+def run_agent_loop_vllm(
+    image: Image.Image,
+    initial_prompt: str,
+    system_prompt: str,
+    vllm_endpoint: str,
+    model_name: str,
+    zoom_tool: ZoomInTool,
+    max_turns: int = 3,
+    max_tokens: int = 512,
+    temperature: float = 0.7,
+) -> Dict[str, Any]:
+    """
+    Run multi-turn agent loop with vLLM server and real ZoomInTool.
+    
+    Args:
+        image: Input image
+        initial_prompt: Initial user prompt
+        system_prompt: System prompt with tool definitions
+        vllm_endpoint: vLLM server endpoint (e.g., http://localhost:8000/v1)
+        model_name: Model name in vLLM
+        zoom_tool: ZoomInTool instance for real tool execution
+        max_turns: Maximum conversation turns
+        max_tokens: Max tokens per generation
+        temperature: Sampling temperature
+    
+    Returns:
+        Dict with keys: final_response, all_responses, tool_calls, num_turns, final_answer
+    """
+    # Create unique trajectory ID
+    trajectory_id = str(uuid.uuid4())
+    
+    # Initialize tool with original image
+    zoom_tool.init_trajectory(trajectory_id, image)
+    
+    all_responses = []
+    tool_calls = []
+    final_response = ""
+    
+    # Build conversation messages
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": image},
+                {"type": "text", "text": initial_prompt}
+            ]
+        }
+    ]
+    
+    for turn in range(max_turns):
+        # Get all accumulated images from tool
+        all_images = zoom_tool.get_all_images(trajectory_id)
+        
+        try:
+            # Call vLLM
+            generated = call_vllm(
+                messages=messages,
+                images=all_images,
+                endpoint=vllm_endpoint,
+                model_name=model_name,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+        except Exception as e:
+            logger.error(f"vLLM call failed on turn {turn + 1}: {e}")
+            break
+        
+        all_responses.append(generated)
+        
+        # Parse response
+        components = parse_response_components(generated)
+        
+        # Check if model requested tool call
+        if components['has_tool_call'] and components['tool_calls']:
+            # Execute real tool
+            cropped_image, obs_text, valid = zoom_tool.execute(trajectory_id, generated)
+            
+            if valid and cropped_image is not None:
+                tc = components['tool_calls'][0]
+                tool_calls.append({
+                    'turn': turn + 1,
+                    'name': tc.get('name', 'zoom_in'),
+                    'arguments': tc.get('arguments', {}),
+                    'result': obs_text,
+                    'valid': True
+                })
+                
+                # Add assistant response to messages
+                messages.append({
+                    "role": "assistant",
+                    "content": generated
+                })
+                
+                # Add tool result with zoomed image
+                follow_up_prompt = (
+                    f"{obs_text}\n"
+                    "Think in the mind first, and then decide whether to call tools one or more times "
+                    "OR provide final answer. Format strictly as: <think>...</think> <tool_call>...</tool_call> "
+                    "<tool_call>...</tool_call> (if any tools needed) OR <answer>...</answer> (if no tools needed)."
+                )
+                messages.append({
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": cropped_image},
+                        {"type": "text", "text": follow_up_prompt}
+                    ]
+                })
+                
+                # Continue to next turn
+                continue
+            else:
+                # Tool execution failed, treat as final response
+                logger.debug(f"Tool execution failed: {obs_text}")
+        
+        # No tool call or tool failed - this is the final response
+        final_response = generated
+        break
+    
+    # Get zoom transform before cleanup (for coordinate conversion)
+    zoom_transform = zoom_tool.get_cumulative_transform(trajectory_id)
+    had_zoom = len(tool_calls) > 0
+    
+    # Cleanup trajectory
+    zoom_tool.delete_trajectory(trajectory_id)
+    
+    # If we exhausted turns without final answer, use last response
+    if not final_response and all_responses:
+        final_response = all_responses[-1]
+    
+    return {
+        'final_response': final_response,
+        'all_responses': all_responses,
+        'tool_calls': tool_calls,
+        'num_turns': len(all_responses),
+        'final_answer': parse_response_components(final_response).get('answer', '') if final_response else '',
+        'zoom_transform': zoom_transform,  # (x_off, y_off, scale_x, scale_y)
+        'had_zoom': had_zoom,
+    }
+
+
 def parse_response_components(generated_text: str) -> Dict[str, Any]:
     """
     Parse all components from generated text following the CoF format.
@@ -690,6 +1234,55 @@ def parse_box_predictions(text: str, img_shape: Tuple[int, int] = (1000, 1000)) 
         logger.debug(f"JSON parsing failed: {e}")
     
     return pairs
+
+
+def transform_box_with_zoom(box: List[float], zoom_transform: Tuple[float, float, float, float]) -> List[int]:
+    """
+    Transform a box from zoomed view coordinates back to original image coordinates.
+    
+    Args:
+        box: Box in current view's 1000x1000 coordinates [x1, y1, x2, y2]
+        zoom_transform: (x_offset, y_offset, scale_x, scale_y) from ZoomInTool
+        
+    Returns:
+        Box in original image's 1000x1000 coordinates
+    """
+    x_off, y_off, scale_x, scale_y = zoom_transform
+    
+    x1, y1, x2, y2 = [float(c) / 1000.0 for c in box]
+    
+    # Transform back to original coordinates
+    orig_x1 = (x1 * scale_x + x_off) * 1000
+    orig_y1 = (y1 * scale_y + y_off) * 1000
+    orig_x2 = (x2 * scale_x + x_off) * 1000
+    orig_y2 = (y2 * scale_y + y_off) * 1000
+    
+    return [int(orig_x1), int(orig_y1), int(orig_x2), int(orig_y2)]
+
+
+def transform_pairs_with_zoom(pairs: List[Dict], zoom_transform: Tuple[float, float, float, float]) -> List[Dict]:
+    """
+    Transform all pairs from zoomed view coordinates to original image coordinates.
+    
+    Args:
+        pairs: List of pairs with 'person_box' and 'object_box'
+        zoom_transform: (x_offset, y_offset, scale_x, scale_y)
+        
+    Returns:
+        Transformed pairs
+    """
+    transformed = []
+    for pair in pairs:
+        person_box = pair.get('person_box', [])
+        object_box = pair.get('object_box', [])
+        
+        if len(person_box) == 4 and len(object_box) == 4:
+            transformed.append({
+                'person_box': transform_box_with_zoom(person_box, zoom_transform),
+                'object_box': transform_box_with_zoom(object_box, zoom_transform),
+            })
+    
+    return transformed
 
 
 def clean_action_response(response_text: str) -> str:
@@ -1115,6 +1708,383 @@ def evaluate_grounding_task(
     return metrics, detailed_results
 
 
+# =============================================================================
+# VLLM EVALUATION FUNCTIONS
+# =============================================================================
+
+def evaluate_referring_task_vllm(
+    test_data: List[Dict],
+    image_base_dir: str,
+    vllm_endpoint: str,
+    model_name: str,
+    max_samples: Optional[int] = None,
+    verbose: bool = False,
+) -> Tuple[Dict, List[Dict]]:
+    """
+    Evaluate on referring task using vLLM server with real tool calling.
+    
+    Args:
+        test_data: Test dataset
+        image_base_dir: Base directory for images
+        vllm_endpoint: vLLM server endpoint
+        model_name: Model name in vLLM
+        max_samples: Maximum samples to evaluate
+        verbose: Show detailed output
+    
+    Returns:
+        Tuple of (metrics dict, detailed results list)
+    """
+    from utils.metrics import evaluate_referring_nltk, evaluate_referring_simple
+    
+    predictions = []
+    references = []
+    detailed_results = []
+    
+    samples = test_data[:max_samples] if max_samples else test_data
+    
+    # Create single ZoomInTool instance for all evaluations
+    zoom_tool = ZoomInTool(padding=(0.1, 0.1))
+    
+    # Check vLLM health
+    if not check_vllm_health(vllm_endpoint, model_name):
+        raise RuntimeError(f"vLLM server not healthy or model '{model_name}' not available")
+    
+    logger.info(f"Starting vLLM evaluation with {len(samples)} samples")
+    
+    for idx, sample in enumerate(tqdm(samples, desc="Evaluating referring (vLLM)")):
+        try:
+            # Get data
+            file_name = sample["file_name"]
+            boxes = sample.get("boxes_1000", sample.get("boxes", []))
+            person_idx = sample.get("person_box_idx", 0)
+            object_idx = sample.get("object_box_idx", 1)
+            gt_action = sample.get("gt_action", sample.get("response", ""))
+            
+            if len(boxes) < 2:
+                continue
+            
+            person_box_raw = boxes[person_idx]
+            object_box_raw = boxes[object_idx]
+            
+            # Load image
+            image_path = get_image_path(file_name, image_base_dir)
+            if not Path(image_path).exists():
+                logger.warning(f"Image not found: {image_path}")
+                continue
+            
+            image = Image.open(image_path).convert("RGB")
+            img_width, img_height = image.size
+            
+            # Normalize bounding boxes to 1000x1000 format
+            person_box = normalize_bbox_to_1000(person_box_raw, img_width, img_height)
+            object_box = normalize_bbox_to_1000(object_box_raw, img_width, img_height)
+            
+            # Create prompt
+            user_prompt = create_referring_prompt(person_box, object_box)
+            
+            # Run agent loop with vLLM
+            agent_result = run_agent_loop_vllm(
+                image=image,
+                initial_prompt=user_prompt,
+                system_prompt=SYSTEM_PROMPT,
+                vllm_endpoint=vllm_endpoint,
+                model_name=model_name,
+                zoom_tool=zoom_tool,
+                max_turns=3,
+                max_tokens=256,
+            )
+            
+            generated = agent_result['final_response']
+            all_tool_calls = agent_result['tool_calls']
+            
+            answer = parse_answer(generated)
+            pred = clean_action_response(answer)
+            
+            predictions.append(pred)
+            references.append(gt_action)
+            
+            # Parse response components
+            components = parse_response_components(generated)
+            
+            detailed_results.append({
+                "file_name": file_name,
+                "person_box": person_box,
+                "object_box": object_box,
+                "gt_action": gt_action,
+                "predicted": pred,
+                "raw_answer": answer,
+                "full_response": generated,
+                "all_responses": agent_result.get('all_responses', [generated]),  # All turn responses
+                "thinking": components['thinking'],
+                "tool_calls": all_tool_calls if all_tool_calls else components['tool_calls'],
+                "has_tool_call": len(all_tool_calls) > 0 or components['has_tool_call'],
+                "answer_tag": components['answer'],
+                "num_turns": agent_result['num_turns'],
+            })
+            
+            # Verbose output
+            if verbose and idx < 20:
+                print(f"\n{'='*60}")
+                print(f"[Sample {idx+1}] {file_name}")
+                print(f"{'='*60}")
+                print(f"  Person box: {person_box}")
+                print(f"  Object box: {object_box}")
+                print(f"  GT action: {gt_action}")
+                
+                # Show all responses (for multi-turn debugging)
+                print(f"\n  Model Responses ({agent_result['num_turns']} turns):")
+                for turn_idx, resp in enumerate(agent_result.get('all_responses', [generated])):
+                    print(f"    --- Turn {turn_idx + 1} ---")
+                    # Show full response for debugging
+                    print(f"    {resp[:600]}{'...' if len(resp) > 600 else ''}")
+                
+                # Show tool calls with full details
+                if all_tool_calls:
+                    print(f"\n  Tool Execution Details:")
+                    for tc in all_tool_calls:
+                        print(f"    Turn {tc['turn']}: {tc['name']}")
+                        print(f"      Args: {tc.get('arguments', {})}")
+                        print(f"      Result: {tc.get('result', 'N/A')}")
+                        print(f"      Valid: {tc.get('valid', 'N/A')}")
+                
+                print(f"\n  Final Prediction: {pred if pred else '[EMPTY]'}")
+                
+                if pred and gt_action:
+                    is_exact = pred.lower().strip() == gt_action.lower().strip()
+                    is_partial = any(w in pred.lower() for w in gt_action.lower().split())
+                    status = "✓ EXACT" if is_exact else ("~ PARTIAL" if is_partial else "✗ MISMATCH")
+                    print(f"  Match Status: {status}")
+            
+        except Exception as e:
+            logger.warning(f"Error processing sample {idx}: {e}")
+            continue
+    
+    # Compute metrics
+    logger.info(f"Computing COCO caption metrics for {len(predictions)} samples...")
+    
+    try:
+        metrics = evaluate_referring_nltk(predictions, references)
+    except Exception as e:
+        logger.warning(f"NLTK evaluation failed: {e}, using simple metrics")
+        metrics = evaluate_referring_simple(predictions, references)
+    
+    metrics["num_samples"] = len(predictions)
+    
+    return metrics, detailed_results
+
+
+def evaluate_grounding_task_vllm(
+    test_data: List[Dict],
+    image_base_dir: str,
+    vllm_endpoint: str,
+    model_name: str,
+    max_samples: Optional[int] = None,
+    verbose: bool = False,
+) -> Tuple[Dict, List[Dict]]:
+    """
+    Evaluate on grounding task using vLLM server with real tool calling.
+    
+    Args:
+        test_data: Test dataset
+        image_base_dir: Base directory for images
+        vllm_endpoint: vLLM server endpoint
+        model_name: Model name in vLLM
+        max_samples: Maximum samples to evaluate
+        verbose: Show detailed output
+    
+    Returns:
+        Tuple of (metrics dict, detailed results list)
+    """
+    from utils.metrics import evaluate_grounding
+    
+    results = []
+    detailed_results = []
+    
+    samples = test_data[:max_samples] if max_samples else test_data
+    
+    # Create single ZoomInTool instance
+    zoom_tool = ZoomInTool(padding=(0.1, 0.1))
+    
+    # Check vLLM health
+    if not check_vllm_health(vllm_endpoint, model_name):
+        raise RuntimeError(f"vLLM server not healthy or model '{model_name}' not available")
+    
+    logger.info(f"Starting vLLM grounding evaluation with {len(samples)} samples")
+    
+    for idx, sample in enumerate(tqdm(samples, desc="Evaluating grounding (vLLM)")):
+        try:
+            file_name = sample["file_name"]
+            action = sample["action"]
+            object_category = sample["object_category"]
+            boxes = sample.get("boxes_1000", sample.get("boxes", []))
+            num_pairs = sample.get("num_pairs", 1)
+            gt_box_inds = sample.get("gt_box_inds", list(range(num_pairs * 2)))
+            img_height = sample.get("height", 1000)
+            img_width = sample.get("width", 1000)
+            
+            # Build ground truth pairs
+            gt_pairs = []
+            for i in range(num_pairs):
+                person_idx = gt_box_inds[i * 2]
+                object_idx = gt_box_inds[i * 2 + 1]
+                
+                if person_idx < len(boxes) and object_idx < len(boxes):
+                    person_box_raw = boxes[person_idx]
+                    object_box_raw = boxes[object_idx]
+                    
+                    person_box = normalize_bbox_to_1000(person_box_raw, img_width, img_height)
+                    object_box = normalize_bbox_to_1000(object_box_raw, img_width, img_height)
+                    
+                    gt_pairs.append({
+                        "person_box": person_box,
+                        "object_box": object_box
+                    })
+            
+            if not gt_pairs:
+                continue
+            
+            # Load image
+            image_path = get_image_path(file_name, image_base_dir)
+            if not Path(image_path).exists():
+                logger.warning(f"Image not found: {image_path}")
+                continue
+            
+            image = Image.open(image_path).convert("RGB")
+            
+            # Create prompt
+            user_prompt = create_grounding_prompt(action, object_category)
+            
+            # Run agent loop with vLLM
+            agent_result = run_agent_loop_vllm(
+                image=image,
+                initial_prompt=user_prompt,
+                system_prompt=SYSTEM_PROMPT,
+                vllm_endpoint=vllm_endpoint,
+                model_name=model_name,
+                zoom_tool=zoom_tool,
+                max_turns=3,
+                max_tokens=500,
+            )
+            
+            generated = agent_result['final_response']
+            all_tool_calls = agent_result['tool_calls']
+            zoom_transform = agent_result.get('zoom_transform', (0.0, 0.0, 1.0, 1.0))
+            had_zoom = agent_result.get('had_zoom', False)
+            
+            # Parse predicted boxes
+            pred_pairs_raw = parse_box_predictions(generated, (img_height, img_width))
+            
+            # Transform boxes back to original image coordinates if there was a zoom
+            if had_zoom and pred_pairs_raw:
+                pred_pairs = transform_pairs_with_zoom(pred_pairs_raw, zoom_transform)
+            else:
+                pred_pairs = pred_pairs_raw
+            
+            results.append({
+                "predicted_pairs": pred_pairs,
+                "gt_pairs": gt_pairs,
+            })
+            
+            # Parse response components
+            components = parse_response_components(generated)
+            
+            detailed_results.append({
+                "file_name": file_name,
+                "action": action,
+                "object_category": object_category,
+                "img_width": img_width,
+                "img_height": img_height,
+                "gt_pairs": gt_pairs,
+                "predicted_pairs": pred_pairs,
+                "pred_pairs_raw": pred_pairs_raw if had_zoom else None,  # Store raw for debugging
+                "zoom_transform": zoom_transform if had_zoom else None,
+                "num_pred": len(pred_pairs),
+                "num_gt": len(gt_pairs),
+                "full_response": generated,
+                "all_responses": agent_result.get('all_responses', [generated]),  # All turn responses
+                "thinking": components['thinking'],
+                "tool_calls": all_tool_calls if all_tool_calls else components['tool_calls'],
+                "has_tool_call": len(all_tool_calls) > 0 or components['has_tool_call'],
+                "answer_tag": components['answer'],
+                "num_turns": agent_result['num_turns'],
+            })
+            
+            # Verbose output
+            if verbose and idx < 20:
+                print(f"\n{'='*60}")
+                print(f"[Sample {idx+1}] {file_name}")
+                print(f"{'='*60}")
+                print(f"  Action: {action} {object_category}")
+                print(f"  Image size: {img_width}x{img_height}")
+                
+                # Show GT pairs with boxes
+                print(f"\n  Ground Truth ({len(gt_pairs)} pairs):")
+                for i, gt in enumerate(gt_pairs):
+                    print(f"    GT {i+1}: Person {gt['person_box']}, Object {gt['object_box']}")
+                
+                # Show all responses (for multi-turn debugging)
+                print(f"\n  Model Responses ({agent_result['num_turns']} turns):")
+                for turn_idx, resp in enumerate(agent_result.get('all_responses', [generated])):
+                    print(f"    --- Turn {turn_idx + 1} ---")
+                    # Show full response for debugging
+                    print(f"    {resp[:500]}{'...' if len(resp) > 500 else ''}")
+                
+                # Show tool calls with details
+                if all_tool_calls:
+                    print(f"\n  Tool Execution Details:")
+                    for tc in all_tool_calls:
+                        print(f"    Turn {tc['turn']}: {tc['name']}")
+                        print(f"      Args: {tc.get('arguments', {})}")
+                        print(f"      Result: {tc.get('result', 'N/A')}")
+                        print(f"      Valid: {tc.get('valid', 'N/A')}")
+                
+                # Show predicted pairs (with transformation info if applicable)
+                print(f"\n  Predictions ({len(pred_pairs)} pairs):")
+                if had_zoom and pred_pairs_raw:
+                    print(f"    [Coordinates transformed from zoomed view to original]")
+                    print(f"    Zoom transform: offset=({zoom_transform[0]:.3f}, {zoom_transform[1]:.3f}), scale=({zoom_transform[2]:.3f}, {zoom_transform[3]:.3f})")
+                    for i, (raw, transformed) in enumerate(zip(pred_pairs_raw[:3], pred_pairs[:3])):
+                        print(f"    Pred {i+1} (raw):    Person {raw['person_box']}, Object {raw['object_box']}")
+                        print(f"    Pred {i+1} (transf): Person {transformed['person_box']}, Object {transformed['object_box']}")
+                else:
+                    for i, pair in enumerate(pred_pairs[:5]):
+                        print(f"    Pred {i+1}: Person {pair['person_box']}, Object {pair['object_box']}")
+                
+                # Compare GT vs Pred boxes with IoU
+                if pred_pairs and gt_pairs:
+                    print(f"\n  IoU Comparison (first pred vs first GT):")
+                    from utils.metrics import calculate_iou
+                    p_pred = pred_pairs[0]['person_box']
+                    o_pred = pred_pairs[0]['object_box']
+                    p_gt = gt_pairs[0]['person_box']
+                    o_gt = gt_pairs[0]['object_box']
+                    person_iou = calculate_iou(p_pred, p_gt)
+                    object_iou = calculate_iou(o_pred, o_gt)
+                    print(f"    Person IoU: {person_iou:.4f} (pred {p_pred} vs gt {p_gt})")
+                    print(f"    Object IoU: {object_iou:.4f} (pred {o_pred} vs gt {o_gt})")
+                    
+                    # Show if it would match at IoU 0.5
+                    if person_iou >= 0.5 and object_iou >= 0.5:
+                        print(f"    --> MATCH at IoU 0.5 threshold!")
+                    else:
+                        print(f"    --> NO MATCH (need both >= 0.5)")
+            
+        except Exception as e:
+            logger.warning(f"Error processing sample {idx}: {e}")
+            continue
+    
+    # Compute metrics
+    logger.info(f"Computing grounding metrics for {len(results)} samples...")
+    metrics = evaluate_grounding(
+        [r["predicted_pairs"] for r in results],
+        [r["gt_pairs"] for r in results],
+    )
+    
+    metrics["num_samples"] = len(results)
+    
+    return metrics, detailed_results
+
+
 def format_attention_for_viz(
     attention_weights, 
     boxes: List[List[float]], 
@@ -1283,7 +2253,7 @@ def save_results(
     task_type: str,
     save_detailed: bool = True,
 ):
-    """Save evaluation results to files."""
+    """Save evaluation results to files with full detailed logging."""
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     
@@ -1295,40 +2265,166 @@ def save_results(
         json.dump(metrics, f, indent=2)
     logger.info(f"Metrics saved to {metrics_file}")
     
-    # Save detailed results
+    # Save detailed results (JSON)
     if save_detailed:
         detailed_file = output_path / f"{task_type}_detailed_{timestamp}.json"
         with open(detailed_file, 'w') as f:
             json.dump(detailed_results, f, indent=2)
         logger.info(f"Detailed results saved to {detailed_file}")
     
-    # Save summary log
+    # Save comprehensive log with full details
     log_file = output_path / f"{task_type}_log_{timestamp}.txt"
     with open(log_file, 'w') as f:
-        f.write(f"Evaluation Results - {task_type.upper()}\n")
+        f.write("=" * 80 + "\n")
+        f.write(f"EVALUATION LOG - {task_type.upper()}\n")
         f.write(f"Timestamp: {timestamp}\n")
-        f.write("=" * 60 + "\n\n")
+        f.write(f"Total samples: {len(detailed_results)}\n")
+        f.write("=" * 80 + "\n\n")
         
-        f.write("METRICS:\n")
+        # Write metrics summary
+        f.write("METRICS SUMMARY:\n")
+        f.write("-" * 40 + "\n")
         for key, value in metrics.items():
             if isinstance(value, float):
                 f.write(f"  {key}: {value:.4f}\n")
             else:
                 f.write(f"  {key}: {value}\n")
+        f.write("\n")
         
-        f.write("\n" + "=" * 60 + "\n")
-        f.write("SAMPLE RESPONSES (first 10):\n\n")
+        # Write detailed per-sample logs
+        f.write("=" * 80 + "\n")
+        f.write("DETAILED SAMPLE LOGS:\n")
+        f.write("=" * 80 + "\n\n")
         
-        for i, result in enumerate(detailed_results[:10]):
-            f.write(f"Sample {i+1}: {result.get('file_name', 'N/A')}\n")
-            if 'gt_action' in result:
-                f.write(f"  GT Action: {result['gt_action']}\n")
-                f.write(f"  Predicted: {result['predicted']}\n")
-            elif 'action' in result:
-                f.write(f"  Action: {result['action']} {result.get('object_category', '')}\n")
-                f.write(f"  GT pairs: {result.get('num_gt', len(result.get('gt_pairs', [])))}\n")
-                f.write(f"  Pred pairs: {result.get('num_pred', len(result.get('predicted_pairs', [])))}\n")
-            f.write(f"  Response: {result.get('full_response', '')[:200]}...\n\n")
+        for i, result in enumerate(detailed_results):
+            f.write(f"{'='*80}\n")
+            f.write(f"[SAMPLE {i+1}] {result.get('file_name', 'N/A')}\n")
+            f.write(f"{'='*80}\n\n")
+            
+            # Task-specific info
+            if task_type == 'referring':
+                f.write(f"INPUT:\n")
+                f.write(f"  Person box: {result.get('person_box', 'N/A')}\n")
+                f.write(f"  Object box: {result.get('object_box', 'N/A')}\n")
+                f.write(f"  Ground Truth Action: {result.get('gt_action', 'N/A')}\n\n")
+            else:  # grounding
+                f.write(f"INPUT:\n")
+                f.write(f"  Action: {result.get('action', 'N/A')} {result.get('object_category', '')}\n")
+                f.write(f"  Image size: {result.get('img_width', 'N/A')}x{result.get('img_height', 'N/A')}\n")
+                f.write(f"\n  Ground Truth Pairs ({len(result.get('gt_pairs', []))}):\n")
+                for j, gt in enumerate(result.get('gt_pairs', [])):
+                    f.write(f"    GT {j+1}: Person {gt.get('person_box', 'N/A')}, Object {gt.get('object_box', 'N/A')}\n")
+                f.write("\n")
+            
+            # Number of turns
+            num_turns = result.get('num_turns', 1)
+            all_responses = result.get('all_responses', [result.get('full_response', '')])
+            tool_calls = result.get('tool_calls', [])
+            
+            f.write(f"CONVERSATION ({num_turns} turn{'s' if num_turns > 1 else ''}):\n")
+            f.write("-" * 40 + "\n")
+            
+            # Show each turn's response
+            for turn_idx, response in enumerate(all_responses):
+                f.write(f"\n  --- TURN {turn_idx + 1} ---\n")
+                f.write(f"  {'-'*60}\n")
+                for line in response.split('\n'):
+                    f.write(f"  {line}\n")
+                f.write(f"  {'-'*60}\n")
+                
+                # Show tool call for this turn if applicable
+                turn_tool_calls = [tc for tc in tool_calls if tc.get('turn') == turn_idx + 1]
+                if turn_tool_calls:
+                    for tc in turn_tool_calls:
+                        f.write(f"\n  >> TOOL EXECUTED: {tc.get('name', 'unknown')}\n")
+                        f.write(f"     Arguments: {tc.get('arguments', {})}\n")
+                        f.write(f"     Result: {tc.get('result', 'N/A')}\n")
+                        f.write(f"     Valid: {tc.get('valid', 'N/A')}\n")
+                        f.write(f"     [Image was cropped and passed to next turn]\n")
+            
+            f.write("\n")
+            
+            # Tool calls with full details
+            tool_calls = result.get('tool_calls', [])
+            if tool_calls:
+                f.write(f"TOOL EXECUTION ({len(tool_calls)} call{'s' if len(tool_calls) > 1 else ''}):\n")
+                f.write("-" * 40 + "\n")
+                for tc in tool_calls:
+                    f.write(f"\n  Turn {tc.get('turn', '?')}: {tc.get('name', 'unknown')}\n")
+                    f.write(f"    Arguments:\n")
+                    args = tc.get('arguments', {})
+                    for k, v in args.items():
+                        f.write(f"      {k}: {v}\n")
+                    f.write(f"    Result: {tc.get('result', 'N/A')}\n")
+                    f.write(f"    Valid: {tc.get('valid', 'N/A')}\n")
+                f.write("\n")
+            
+            # Zoom transform info (for grounding)
+            if result.get('zoom_transform'):
+                zt = result['zoom_transform']
+                f.write(f"ZOOM TRANSFORM (applied to predictions):\n")
+                f.write(f"  Offset: ({zt[0]:.4f}, {zt[1]:.4f})\n")
+                f.write(f"  Scale: ({zt[2]:.4f}, {zt[3]:.4f})\n")
+                if result.get('pred_pairs_raw'):
+                    f.write(f"\n  Raw predictions (in zoomed view):\n")
+                    for j, raw in enumerate(result.get('pred_pairs_raw', [])):
+                        f.write(f"    Raw {j+1}: Person {raw.get('person_box', 'N/A')}, Object {raw.get('object_box', 'N/A')}\n")
+                f.write("\n")
+            
+            # Predictions/Results
+            if task_type == 'referring':
+                f.write(f"RESULT:\n")
+                f.write(f"  Predicted Action: {result.get('predicted', 'N/A')}\n")
+                f.write(f"  Raw Answer: {result.get('raw_answer', 'N/A')}\n")
+                gt = result.get('gt_action', '')
+                pred = result.get('predicted', '')
+                if gt and pred:
+                    is_exact = pred.lower().strip() == gt.lower().strip()
+                    f.write(f"  Exact Match: {'YES' if is_exact else 'NO'}\n")
+            else:  # grounding
+                f.write(f"PREDICTIONS ({len(result.get('predicted_pairs', []))}):\n")
+                for j, pred in enumerate(result.get('predicted_pairs', [])):
+                    f.write(f"  Pred {j+1}: Person {pred.get('person_box', 'N/A')}, Object {pred.get('object_box', 'N/A')}\n")
+            
+            # Parsed components
+            f.write(f"\nPARSED COMPONENTS:\n")
+            f.write(f"  Has <think>: {'YES' if result.get('thinking') else 'NO'}\n")
+            f.write(f"  Has <tool_call>: {'YES' if result.get('has_tool_call') else 'NO'}\n")
+            f.write(f"  Has <answer>: {'YES' if result.get('answer_tag') else 'NO'}\n")
+            if result.get('thinking'):
+                f.write(f"\n  Thinking content:\n")
+                thinking = result.get('thinking', '')
+                for line in thinking[:500].split('\n'):
+                    f.write(f"    {line}\n")
+                if len(thinking) > 500:
+                    f.write(f"    ... (truncated)\n")
+            
+            f.write("\n\n")
+        
+        # Statistics summary at the end
+        f.write("=" * 80 + "\n")
+        f.write("STATISTICS SUMMARY:\n")
+        f.write("=" * 80 + "\n")
+        
+        total = len(detailed_results)
+        has_think = sum(1 for r in detailed_results if r.get('thinking'))
+        has_tool = sum(1 for r in detailed_results if r.get('has_tool_call'))
+        has_answer = sum(1 for r in detailed_results if r.get('answer_tag'))
+        
+        f.write(f"  Total samples: {total}\n")
+        f.write(f"  Has <think>: {has_think} ({100*has_think/total:.1f}%)\n")
+        f.write(f"  Has <tool_call>: {has_tool} ({100*has_tool/total:.1f}%)\n")
+        f.write(f"  Has <answer>: {has_answer} ({100*has_answer/total:.1f}%)\n")
+        
+        if has_tool > 0:
+            tool_counts = {}
+            for r in detailed_results:
+                for tc in r.get('tool_calls', []):
+                    name = tc.get('name', 'unknown')
+                    tool_counts[name] = tool_counts.get(name, 0) + 1
+            f.write(f"\n  Tool usage breakdown:\n")
+            for name, count in tool_counts.items():
+                f.write(f"    {name}: {count}\n")
     
     logger.info(f"Log saved to {log_file}")
 
@@ -1406,7 +2502,30 @@ def main():
         help="Show detailed per-sample output during evaluation"
     )
     
+    # vLLM arguments
+    parser.add_argument(
+        "--use_vllm",
+        action="store_true",
+        help="Use vLLM server for inference instead of HuggingFace"
+    )
+    parser.add_argument(
+        "--vllm_endpoint",
+        type=str,
+        default="http://localhost:8000/v1",
+        help="vLLM server endpoint (default: http://localhost:8000/v1)"
+    )
+    parser.add_argument(
+        "--vllm_model",
+        type=str,
+        default=None,
+        help="Model name in vLLM server (defaults to model_path basename)"
+    )
+    
     args = parser.parse_args()
+    
+    # Determine vLLM model name
+    if args.use_vllm and args.vllm_model is None:
+        args.vllm_model = Path(args.model_path).name
     
     # Print configuration
     print("\n" + "=" * 70)
@@ -1419,29 +2538,59 @@ def main():
     print(f"  Max samples: {args.max_samples or 'all'}")
     print(f"  Output dir:  {args.output_dir}")
     print(f"  Verbose:     {args.verbose}")
+    if args.use_vllm:
+        print(f"  Mode:        vLLM Server")
+        print(f"  Endpoint:    {args.vllm_endpoint}")
+        print(f"  vLLM Model:  {args.vllm_model}")
+    else:
+        print(f"  Mode:        HuggingFace Local")
     print("=" * 70 + "\n")
-    
-    # Load model
-    model, processor = load_model(args.model_path, model_type=args.model_type)
     
     # Load test data
     test_data = load_test_data(args.test_file)
     
-    # Evaluate
-    if args.task_type == "referring":
-        metrics, detailed_results = evaluate_referring_task(
-            model, processor, test_data,
-            args.image_base_dir, args.max_samples,
-            args.visualize_attention, args.viz_output_dir,
-            args.verbose
-        )
+    # Evaluate based on mode
+    if args.use_vllm:
+        # vLLM mode - use vLLM server with real tool calling
+        logger.info("Using vLLM server for evaluation...")
+        
+        if args.task_type == "referring":
+            metrics, detailed_results = evaluate_referring_task_vllm(
+                test_data=test_data,
+                image_base_dir=args.image_base_dir,
+                vllm_endpoint=args.vllm_endpoint,
+                model_name=args.vllm_model,
+                max_samples=args.max_samples,
+                verbose=args.verbose,
+            )
+        else:
+            metrics, detailed_results = evaluate_grounding_task_vllm(
+                test_data=test_data,
+                image_base_dir=args.image_base_dir,
+                vllm_endpoint=args.vllm_endpoint,
+                model_name=args.vllm_model,
+                max_samples=args.max_samples,
+                verbose=args.verbose,
+            )
     else:
-        metrics, detailed_results = evaluate_grounding_task(
-            model, processor, test_data,
-            args.image_base_dir, args.max_samples,
-            args.visualize_attention, args.viz_output_dir,
-            args.verbose
-        )
+        # HuggingFace mode - load model locally
+        logger.info("Using HuggingFace local model for evaluation...")
+        model, processor = load_model(args.model_path, model_type=args.model_type)
+        
+        if args.task_type == "referring":
+            metrics, detailed_results = evaluate_referring_task(
+                model, processor, test_data,
+                args.image_base_dir, args.max_samples,
+                args.visualize_attention, args.viz_output_dir,
+                args.verbose
+            )
+        else:
+            metrics, detailed_results = evaluate_grounding_task(
+                model, processor, test_data,
+                args.image_base_dir, args.max_samples,
+                args.visualize_attention, args.viz_output_dir,
+                args.verbose
+            )
     
     # Print results
     print_metrics(metrics, title=f"{args.task_type.upper()} Evaluation Results")
