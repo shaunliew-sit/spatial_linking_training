@@ -22,6 +22,7 @@ pyyaml>=6.0
 
 # Utilities
 tqdm>=4.65.0
+boto3>=1.28.0  # For S3 downloads
 
 # Visualization (for attention interpretability)
 matplotlib>=3.7.0

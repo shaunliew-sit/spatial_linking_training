@@ -402,6 +402,189 @@ def clean_text(text: str) -> str:
     return text.strip().lower()
 
 
+def evaluate_referring_nltk(
+    predictions: List[str],
+    references: List[str],
+    clean: bool = True,
+    compute_bertscore: bool = True,
+) -> Dict[str, float]:
+    """
+    Evaluate referring predictions using NLTK metrics (no Java required).
+    
+    Computes:
+    - METEOR (via NLTK - doesn't need Java)
+    - CIDEr (via pycocoevalcap - doesn't need Java)
+    - BLEU-1, BLEU-2, BLEU-3, BLEU-4
+    - BERTScore (precision, recall, F1)
+    - Exact match
+    - Verb match (first word)
+    - Word overlap (Jaccard similarity)
+    
+    This is a faster alternative to evaluate_referring_coco that doesn't require Java.
+    """
+    import numpy as np
+    
+    if len(predictions) == 0:
+        return {
+            "METEOR": 0.0, "CIDEr": 0.0, "BLEU_1": 0.0, "BLEU_2": 0.0, "BLEU_3": 0.0, "BLEU_4": 0.0,
+            "exact_match": 0.0, "verb_match": 0.0, "word_overlap": 0.0,
+            "bertscore_precision": 0.0, "bertscore_recall": 0.0, "bertscore_f1": 0.0
+        }
+    
+    # Clean text if requested
+    if clean:
+        predictions = [clean_text(p) for p in predictions]
+        references = [clean_text(r) for r in references]
+    
+    metrics = {}
+    
+    # Try NLTK METEOR (doesn't require Java)
+    try:
+        import nltk
+        from nltk.translate.meteor_score import meteor_score
+        
+        # Download required data (silent)
+        try:
+            nltk.download('wordnet', quiet=True)
+            nltk.download('omw-1.4', quiet=True)
+        except:
+            pass
+        
+        meteor_scores = []
+        for pred, ref in zip(predictions, references):
+            if pred and ref:
+                try:
+                    score = meteor_score([ref.split()], pred.split())
+                    meteor_scores.append(score)
+                except:
+                    meteor_scores.append(0.0)
+            else:
+                meteor_scores.append(0.0)
+        
+        metrics['METEOR'] = float(np.mean(meteor_scores)) if meteor_scores else 0.0
+        
+    except ImportError:
+        logger.warning("NLTK not available for METEOR. Install with: pip install nltk")
+        metrics['METEOR'] = 0.0
+    
+    # BLEU scores using NLTK
+    try:
+        from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+        
+        smoothie = SmoothingFunction().method1
+        
+        for n in [1, 2, 3, 4]:
+            bleu_scores = []
+            for pred, ref in zip(predictions, references):
+                if pred and ref:
+                    try:
+                        weights = tuple([1.0/n] * n + [0.0] * (4-n))
+                        score = sentence_bleu([ref.split()], pred.split(), weights=weights, smoothing_function=smoothie)
+                        bleu_scores.append(score)
+                    except:
+                        bleu_scores.append(0.0)
+                else:
+                    bleu_scores.append(0.0)
+            
+            metrics[f'BLEU_{n}'] = float(np.mean(bleu_scores)) if bleu_scores else 0.0
+            
+    except ImportError:
+        logger.warning("NLTK not available for BLEU. Install with: pip install nltk")
+        for n in [1, 2, 3, 4]:
+            metrics[f'BLEU_{n}'] = 0.0
+    
+    # CIDEr score using pycocoevalcap (doesn't require Java)
+    try:
+        from pycocoevalcap.cider.cider import Cider
+        
+        # Format for pycocoevalcap: {id: [caption]}
+        gts = {i: [ref] for i, ref in enumerate(references) if ref}
+        res = {i: [pred] for i, pred in enumerate(predictions) if pred and i in gts}
+        
+        if gts and res:
+            cider_scorer = Cider()
+            cider_score, _ = cider_scorer.compute_score(gts, res)
+            metrics['CIDEr'] = float(cider_score)
+        else:
+            metrics['CIDEr'] = 0.0
+            
+    except ImportError:
+        logger.warning("pycocoevalcap not available for CIDEr. Install with: pip install pycocoevalcap")
+        metrics['CIDEr'] = 0.0
+    except Exception as e:
+        logger.warning(f"CIDEr computation failed: {e}")
+        metrics['CIDEr'] = 0.0
+    
+    # Exact match
+    exact_matches = sum(1 for p, r in zip(predictions, references) if p == r)
+    metrics['exact_match'] = exact_matches / len(predictions) if len(predictions) > 0 else 0.0
+    
+    # Verb match (first word match)
+    verb_matches = 0
+    for pred, ref in zip(predictions, references):
+        pred_words = pred.split() if pred else []
+        ref_words = ref.split() if ref else []
+        if pred_words and ref_words and pred_words[0] == ref_words[0]:
+            verb_matches += 1
+    metrics['verb_match'] = verb_matches / len(predictions) if len(predictions) > 0 else 0.0
+    
+    # Word overlap (Jaccard similarity)
+    overlaps = []
+    for pred, ref in zip(predictions, references):
+        pred_words = set(pred.split()) if pred else set()
+        ref_words = set(ref.split()) if ref else set()
+        if pred_words or ref_words:
+            intersection = len(pred_words & ref_words)
+            union = len(pred_words | ref_words)
+            overlaps.append(intersection / union if union > 0 else 0.0)
+        else:
+            overlaps.append(0.0)
+    metrics['word_overlap'] = float(np.mean(overlaps)) if overlaps else 0.0
+    
+    # BERTScore computation
+    if compute_bertscore:
+        try:
+            from bert_score import score as bert_score
+            
+            # Filter out empty predictions/references for BERTScore
+            valid_pairs = [(p, r) for p, r in zip(predictions, references) if p and r]
+            
+            if valid_pairs:
+                preds_valid, refs_valid = zip(*valid_pairs)
+                
+                # Compute BERTScore (uses roberta-large by default)
+                P, R, F1 = bert_score(
+                    list(preds_valid), 
+                    list(refs_valid),
+                    model_type="microsoft/deberta-v2-xxlarge-mnli",
+                    lang="en",
+                    batch_size=32,
+                    rescale_with_baseline=True,
+                    verbose=False
+                )
+                
+                metrics['bertscore_precision'] = float(P.mean())
+                metrics['bertscore_recall'] = float(R.mean())
+                metrics['bertscore_f1'] = float(F1.mean())
+            else:
+                metrics['bertscore_precision'] = 0.0
+                metrics['bertscore_recall'] = 0.0
+                metrics['bertscore_f1'] = 0.0
+                
+        except ImportError:
+            logger.warning("bert_score not available. Install with: pip install bert-score")
+            metrics['bertscore_precision'] = 0.0
+            metrics['bertscore_recall'] = 0.0
+            metrics['bertscore_f1'] = 0.0
+        except Exception as e:
+            logger.warning(f"BERTScore computation failed: {e}")
+            metrics['bertscore_precision'] = 0.0
+            metrics['bertscore_recall'] = 0.0
+            metrics['bertscore_f1'] = 0.0
+    
+    return metrics
+
+
 def evaluate_referring_coco(
     predictions: List[str],
     references: List[str],

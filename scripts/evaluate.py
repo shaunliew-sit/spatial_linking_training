@@ -78,10 +78,25 @@ For the function call, return a json object with function name and arguments wit
 # MODEL LOADING
 # =============================================================================
 
-def load_model(model_path: str, device: str = "cuda"):
-    """Load trained model and processor."""
+def load_model(model_path: str, device: str = "cuda", model_type: str = "auto"):
+    """
+    Load trained model and processor.
+    
+    Args:
+        model_path: Path to the model checkpoint
+        device: Device to load the model on
+        model_type: Type of model to load:
+            - "auto": Auto-detect based on checkpoint contents
+            - "spatial_linking": SpatialLinkingInteractionModel with spatial linking module
+            - "base": Standard Qwen3-VL with LoRA adapters (LLaMA Factory style)
+    
+    Returns:
+        Tuple of (model, processor)
+    """
     import warnings
     import os
+    from peft import PeftModel
+    from transformers import Qwen2_5_VLForConditionalGeneration
     
     logger.info(f"Loading model from {model_path}")
     
@@ -89,6 +104,22 @@ def load_model(model_path: str, device: str = "cuda"):
     warnings.filterwarnings("ignore", message=".*torch_dtype.*deprecated.*")
     warnings.filterwarnings("ignore", message=".*Unexpected keyword arguments.*LoraConfig.*")
     warnings.filterwarnings("ignore", message=".*Some weights.*were not initialized.*")
+    
+    # Auto-detect model type
+    if model_type == "auto":
+        spatial_linking_path = os.path.join(model_path, "spatial_linking.pt")
+        adapter_config_path = os.path.join(model_path, "adapter_config.json")
+        
+        if os.path.exists(spatial_linking_path):
+            model_type = "spatial_linking"
+            logger.info("Auto-detected model type: spatial_linking (found spatial_linking.pt)")
+        elif os.path.exists(adapter_config_path):
+            model_type = "base"
+            logger.info("Auto-detected model type: base (LoRA adapter, no spatial_linking)")
+        else:
+            # Default to spatial_linking for backwards compatibility
+            model_type = "spatial_linking"
+            logger.info("Auto-detected model type: spatial_linking (default)")
     
     # Try to load processor from model path, fallback to base model
     try:
@@ -106,29 +137,68 @@ def load_model(model_path: str, device: str = "cuda"):
     if processor.tokenizer.pad_token is None:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
     
-    # Load model with bfloat16 precision
-    model = SpatialLinkingInteractionModel.from_pretrained(
-        model_path,
-        torch_dtype=torch.bfloat16,
-        trust_remote_code=True,
-        device_map="auto",
-    )
-    
-    # IMPORTANT: Load spatial linking weights if available
-    # These are saved separately because PEFT only saves LoRA adapters
-    spatial_linking_path = os.path.join(model_path, "spatial_linking.pt")
-    if os.path.exists(spatial_linking_path):
-        logger.info(f"Loading spatial linking weights from {spatial_linking_path}")
-        spatial_linking_state = torch.load(spatial_linking_path, map_location="cpu")
-        model.spatial_linking.load_state_dict(spatial_linking_state)
-        logger.info(f"  Loaded keys: {list(spatial_linking_state.keys())}")
+    if model_type == "spatial_linking":
+        # Load SpatialLinkingInteractionModel
+        logger.info("Loading SpatialLinkingInteractionModel...")
+        model = SpatialLinkingInteractionModel.from_pretrained(
+            model_path,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+            device_map="auto",
+        )
+        
+        # Load spatial linking weights if available
+        spatial_linking_path = os.path.join(model_path, "spatial_linking.pt")
+        if os.path.exists(spatial_linking_path):
+            logger.info(f"Loading spatial linking weights from {spatial_linking_path}")
+            spatial_linking_state = torch.load(spatial_linking_path, map_location="cpu")
+            model.spatial_linking.load_state_dict(spatial_linking_state)
+            logger.info(f"  Loaded keys: {list(spatial_linking_state.keys())}")
+        else:
+            logger.warning(f"Spatial linking weights not found at {spatial_linking_path}")
+            logger.warning("  The spatial_linking module will use random initialization!")
+        
+        # Set box token IDs
+        model.set_box_token_ids(processor.tokenizer)
+        
     else:
-        logger.warning(f"Spatial linking weights not found at {spatial_linking_path}")
-        logger.warning("  The spatial_linking module will use random initialization!")
-        logger.warning("  This likely means the model was trained before the save fix was applied.")
+        # Load base Qwen3-VL with LoRA adapters (LLaMA Factory style)
+        logger.info("Loading base Qwen3-VL with LoRA adapters...")
+        
+        # Read adapter config to get base model
+        adapter_config_path = os.path.join(model_path, "adapter_config.json")
+        if os.path.exists(adapter_config_path):
+            with open(adapter_config_path, 'r') as f:
+                adapter_config = json.load(f)
+            base_model_name = adapter_config.get("base_model_name_or_path", "Qwen/Qwen3-VL-8B-Instruct")
+        else:
+            base_model_name = "Qwen/Qwen3-VL-8B-Instruct"
+        
+        logger.info(f"  Base model: {base_model_name}")
+        
+        # Try Qwen3-VL first, fallback to Qwen2.5-VL
+        try:
+            from transformers import Qwen3VLForConditionalGeneration
+            base_model = Qwen3VLForConditionalGeneration.from_pretrained(
+                base_model_name,
+                torch_dtype=torch.bfloat16,
+                trust_remote_code=True,
+                device_map="auto",
+            )
+        except ImportError:
+            # Fallback for older transformers versions
+            from transformers import AutoModelForCausalLM
+            base_model = AutoModelForCausalLM.from_pretrained(
+                base_model_name,
+                torch_dtype=torch.bfloat16,
+                trust_remote_code=True,
+                device_map="auto",
+            )
+        
+        # Load LoRA adapter
+        model = PeftModel.from_pretrained(base_model, model_path)
+        logger.info("  LoRA adapter loaded successfully")
     
-    # Set box token IDs
-    model.set_box_token_ids(processor.tokenizer)
     model.eval()
     
     return model, processor
@@ -169,9 +239,9 @@ def get_image_path(file_name: str, image_base_dir: str) -> str:
 # =============================================================================
 
 def create_referring_prompt(person_box: List[int], object_box: List[int]) -> str:
-    """Create referring task prompt matching training format."""
+    """Create referring task prompt matching training format (text-only part)."""
     return (
-        f"<image> Question: What action is the person performing with the object?\n"
+        f"Question: What action is the person performing with the object?\n"
         f"The person is located at {person_box} and the object is at {object_box}.\n"
         f"Respond with ONLY the action phrase in format: \"{{verb}} {{object}}\" "
         f"(e.g., \"riding bicycle\", \"holding cup\"). Use base verb form, no articles.\n"
@@ -181,10 +251,19 @@ def create_referring_prompt(person_box: List[int], object_box: List[int]) -> str
     )
 
 
+def create_referring_prompt_with_image(person_box: List[int], object_box: List[int], image) -> List[dict]:
+    """Create referring task prompt with image as structured content for Qwen3-VL."""
+    text_content = create_referring_prompt(person_box, object_box)
+    return [
+        {"type": "image", "image": image},
+        {"type": "text", "text": text_content}
+    ]
+
+
 def create_grounding_prompt(action: str, object_category: str) -> str:
-    """Create grounding task prompt matching training format."""
+    """Create grounding task prompt matching training format (text-only part)."""
     return (
-        f"<image> Question: Locate every person who is {action} {object_category} "
+        f"Question: Locate every person who is {action} {object_category} "
         f"and the {object_category} they interact with.\n"
         f"For each person-object pair, output bbox coordinates in JSON format like: "
         f"{{\"bbox_2d\": [x1, y1, x2, y2], \"label\": \"description\"}}. "
@@ -193,6 +272,210 @@ def create_grounding_prompt(action: str, object_category: str) -> str:
         f"OR provide final answer. Format strictly as: <think>...</think> <tool_call>...</tool_call> "
         f"<tool_call>...</tool_call> (if any tools needed) OR <answer>...</answer> (if no tools needed)."
     )
+
+
+def create_grounding_prompt_with_image(action: str, object_category: str, image) -> List[dict]:
+    """Create grounding task prompt with image as structured content for Qwen3-VL."""
+    text_content = create_grounding_prompt(action, object_category)
+    return [
+        {"type": "image", "image": image},
+        {"type": "text", "text": text_content}
+    ]
+
+
+def normalize_bbox_to_1000(bbox: List, width: int, height: int) -> List[int]:
+    """
+    Convert pixel coordinates to 1000x1000 normalized format.
+    
+    This matches the training data format where all coordinates are
+    normalized to a 1000x1000 grid regardless of actual image size.
+    
+    Args:
+        bbox: Bounding box in pixel coordinates [x1, y1, x2, y2]
+        width: Image width in pixels
+        height: Image height in pixels
+    
+    Returns:
+        Bounding box in 1000x1000 normalized format
+    """
+    x1, y1, x2, y2 = bbox
+    return [
+        int(x1 * 1000 / width),
+        int(y1 * 1000 / height),
+        int(x2 * 1000 / width),
+        int(y2 * 1000 / height)
+    ]
+
+
+def execute_mock_tool(tool_name: str, arguments: Dict, image: Image.Image) -> Tuple[str, Image.Image]:
+    """
+    Execute a mock tool call and return the result.
+    
+    For zoom_in: crops the image to the specified bbox and returns a description.
+    """
+    if tool_name == "zoom_in":
+        bbox = arguments.get("bbox_2d", arguments.get("bbox", []))
+        target = arguments.get("target_image", 1)
+        
+        if len(bbox) == 4:
+            # Convert from 1000x1000 normalized to pixel coordinates
+            w, h = image.size
+            x1 = int(bbox[0] * w / 1000)
+            y1 = int(bbox[1] * h / 1000)
+            x2 = int(bbox[2] * w / 1000)
+            y2 = int(bbox[3] * h / 1000)
+            
+            # Ensure valid crop region
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w, x2), min(h, y2)
+            
+            if x2 > x1 and y2 > y1:
+                cropped = image.crop((x1, y1, x2, y2))
+                result = f"Zoomed into region {bbox}. Now viewing a {cropped.size[0]}x{cropped.size[1]} cropped area."
+                return result, cropped
+        
+        return "Invalid bbox format. Expected [x1, y1, x2, y2].", image
+    
+    return f"Unknown tool: {tool_name}", image
+
+
+def run_agent_loop(
+    model,
+    processor,
+    image: Image.Image,
+    initial_prompt: str,
+    system_prompt: str,
+    device: str,
+    max_turns: int = 3,
+    max_new_tokens: int = 512,
+) -> Dict[str, Any]:
+    """
+    Run multi-turn agent loop with tool execution.
+    
+    Matches verl-tool approach: accumulate ALL images and pass them together.
+    Each turn's image is embedded in the message content, and all images
+    are passed to the processor in order.
+    
+    Returns:
+        Dict with keys: final_response, all_responses, tool_calls, num_turns
+    """
+    # Accumulate all images across turns
+    all_images = [image.copy()]
+    current_image = image.copy()
+    all_responses = []
+    tool_calls = []
+    
+    # Build conversation messages (will grow each turn)
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": image},
+                {"type": "text", "text": initial_prompt}
+            ]
+        }
+    ]
+    
+    final_response = ""
+    
+    for turn in range(max_turns):
+        # Apply chat template
+        text = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        
+        # Process inputs with ALL accumulated images
+        inputs = processor(
+            text=[text],
+            images=all_images,
+            return_tensors="pt",
+            truncation=True,
+            max_length=4096,
+        )
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        
+        # Generate
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+                temperature=0.7,
+                top_p=0.9,
+                pad_token_id=processor.tokenizer.pad_token_id,
+            )
+        
+        # Decode response (only new tokens)
+        generated = processor.decode(
+            outputs[0][inputs['input_ids'].shape[1]:],
+            skip_special_tokens=True
+        )
+        all_responses.append(generated)
+        
+        # Parse response
+        components = parse_response_components(generated)
+        
+        # Check if model requested tool call
+        if components['has_tool_call'] and components['tool_calls']:
+            # Execute first tool call
+            tc = components['tool_calls'][0]
+            if isinstance(tc, dict) and 'name' in tc:
+                tool_name = tc['name']
+                arguments = tc.get('arguments', {})
+                
+                # Execute the tool (e.g., zoom_in crops the image)
+                tool_result, new_image = execute_mock_tool(tool_name, arguments, current_image)
+                current_image = new_image
+                
+                # Add the new image to accumulated images
+                all_images.append(new_image)
+                
+                tool_calls.append({
+                    'turn': turn + 1,
+                    'name': tool_name,
+                    'arguments': arguments,
+                    'result': tool_result
+                })
+                
+                # Add assistant response to messages
+                messages.append({
+                    "role": "assistant",
+                    "content": generated
+                })
+                
+                # Add tool result as new user message with zoomed image
+                follow_up_prompt = (
+                    "Think in the mind first, and then decide whether to call tools one or more times "
+                    "OR provide final answer. Format strictly as: <think>...</think> <tool_call>...</tool_call> "
+                    "<tool_call>...</tool_call> (if any tools needed) OR <answer>...</answer> (if no tools needed)."
+                )
+                messages.append({
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": new_image},
+                        {"type": "text", "text": follow_up_prompt}
+                    ]
+                })
+                
+                # Continue to next turn
+                continue
+        
+        # No tool call - this is the final response
+        final_response = generated
+        break
+    
+    # If we exhausted turns without final answer, use last response
+    if not final_response and all_responses:
+        final_response = all_responses[-1]
+    
+    return {
+        'final_response': final_response,
+        'all_responses': all_responses,
+        'tool_calls': tool_calls,
+        'num_turns': len(all_responses),
+        'final_answer': parse_response_components(final_response).get('answer', '') if final_response else ''
+    }
 
 
 def parse_response_components(generated_text: str) -> Dict[str, Any]:
@@ -454,7 +737,7 @@ def evaluate_referring_task(
 ) -> Tuple[Dict, List[Dict]]:
     """Evaluate on referring task (action prediction)."""
     
-    from utils.metrics import evaluate_referring_coco, evaluate_referring_simple
+    from utils.metrics import evaluate_referring_nltk, evaluate_referring_simple
     
     predictions = []
     references = []
@@ -489,16 +772,10 @@ def evaluate_referring_task(
             if len(boxes) < 2:
                 continue
             
-            person_box = boxes[person_idx]
-            object_box = boxes[object_idx]
-            interaction_box = [
-                min(person_box[0], object_box[0]),
-                min(person_box[1], object_box[1]),
-                max(person_box[2], object_box[2]),
-                max(person_box[3], object_box[3])
-            ]
+            person_box_raw = boxes[person_idx]
+            object_box_raw = boxes[object_idx]
             
-            # Load image
+            # Load image first to get dimensions for normalization
             image_path = get_image_path(file_name, image_base_dir)
             if not Path(image_path).exists():
                 logger.warning(f"Image not found: {image_path}")
@@ -507,21 +784,35 @@ def evaluate_referring_task(
             image = Image.open(image_path).convert("RGB")
             img_width, img_height = image.size
             
-            # Create prompt (matching training format)
+            # Normalize bounding boxes to 1000x1000 format (matching training data)
+            person_box = normalize_bbox_to_1000(person_box_raw, img_width, img_height)
+            object_box = normalize_bbox_to_1000(object_box_raw, img_width, img_height)
+            
+            # Compute interaction box in normalized coordinates
+            interaction_box = [
+                min(person_box[0], object_box[0]),
+                min(person_box[1], object_box[1]),
+                max(person_box[2], object_box[2]),
+                max(person_box[3], object_box[3])
+            ]
+            
+            # Create prompt with structured image content for Qwen3-VL
             user_prompt = create_referring_prompt(person_box, object_box)
+            user_content = create_referring_prompt_with_image(person_box, object_box, image)
             
             messages = [
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt}
+                {"role": "user", "content": user_content}
             ]
             
-            text = processor.tokenizer.apply_chat_template(
+            # Use processor's apply_chat_template which handles images properly
+            text = processor.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True
             )
             
-            # Process inputs with explicit truncation
+            # Process inputs - images already handled by apply_chat_template
             inputs = processor(
-                text=text, 
+                text=[text], 
                 images=[image], 
                 return_tensors="pt",
                 truncation=True,
@@ -568,10 +859,10 @@ def evaluate_referring_task(
                     except Exception as e:
                         logger.debug(f"Visualization failed for sample {idx}: {e}")
                 
-                # Generate response
+                # Generate response (single turn first)
                 outputs = model.generate(
                     **inputs,
-                    max_new_tokens=150,
+                    max_new_tokens=256,
                     do_sample=False,
                     pad_token_id=processor.tokenizer.pad_token_id,
                 )
@@ -579,6 +870,19 @@ def evaluate_referring_task(
             # Decode only the NEW tokens (not the full sequence)
             generated_ids = outputs[0][inputs['input_ids'].shape[1]:]
             generated = processor.decode(generated_ids, skip_special_tokens=True)
+            
+            # Check if model requested tool call - if so, run agent loop
+            first_components = parse_response_components(generated)
+            all_tool_calls = []
+            
+            if first_components['has_tool_call'] and first_components['tool_calls']:
+                # Run multi-turn with tool execution
+                agent_result = run_agent_loop(
+                    model, processor, image, user_prompt, SYSTEM_PROMPT,
+                    device, max_turns=3, max_new_tokens=256
+                )
+                generated = agent_result['final_response']
+                all_tool_calls = agent_result['tool_calls']
             
             answer = parse_answer(generated)
             pred = clean_action_response(answer)
@@ -599,9 +903,10 @@ def evaluate_referring_task(
                 "full_response": generated,
                 # Parsed components
                 "thinking": components['thinking'],
-                "tool_calls": components['tool_calls'],
-                "has_tool_call": components['has_tool_call'],
+                "tool_calls": all_tool_calls if all_tool_calls else components['tool_calls'],
+                "has_tool_call": components['has_tool_call'] or len(all_tool_calls) > 0,
                 "answer_tag": components['answer'],
+                "num_turns": len(all_tool_calls) + 1 if all_tool_calls else 1,
             })
             
             # Verbose output with full component breakdown
@@ -614,6 +919,15 @@ def evaluate_referring_task(
                 print(f"  GT action: {gt_action}")
                 print(f"\n  Model Response:")
                 print(format_response_for_display(generated))
+                
+                # Show tool execution details if any
+                if all_tool_calls:
+                    print(f"\n  Tool Execution:")
+                    print(f"    Turns: {len(all_tool_calls) + 1}")
+                    for tc in all_tool_calls:
+                        print(f"    - Turn {tc['turn']}: {tc['name']}({tc.get('arguments', {})})")
+                        print(f"      Result: {tc['result'][:80]}...")
+                
                 print(f"\n  Final Prediction: {pred if pred else '[EMPTY]'}")
                 
                 # Show match status
@@ -631,9 +945,10 @@ def evaluate_referring_task(
     logger.info(f"Computing COCO caption metrics for {len(predictions)} samples...")
     
     try:
-        metrics = evaluate_referring_coco(predictions, references)
+        # Use NLTK-based metrics (doesn't require Java)
+        metrics = evaluate_referring_nltk(predictions, references)
     except Exception as e:
-        logger.warning(f"COCO evaluation failed: {e}, using simple metrics")
+        logger.warning(f"NLTK evaluation failed: {e}, using simple metrics")
         metrics = evaluate_referring_simple(predictions, references)
     
     metrics["num_samples"] = len(predictions)
@@ -676,15 +991,23 @@ def evaluate_grounding_task(
             img_width = sample.get("width", 1000)
             
             # Build ground truth pairs from simplified format
+            # Normalize boxes to 1000x1000 format to match model output
             gt_pairs = []
             for i in range(num_pairs):
                 person_idx = gt_box_inds[i * 2]
                 object_idx = gt_box_inds[i * 2 + 1]
                 
                 if person_idx < len(boxes) and object_idx < len(boxes):
+                    person_box_raw = boxes[person_idx]
+                    object_box_raw = boxes[object_idx]
+                    
+                    # Normalize to 1000x1000 format
+                    person_box = normalize_bbox_to_1000(person_box_raw, img_width, img_height)
+                    object_box = normalize_bbox_to_1000(object_box_raw, img_width, img_height)
+                    
                     gt_pairs.append({
-                        "person_box": boxes[person_idx],
-                        "object_box": boxes[object_idx]
+                        "person_box": person_box,
+                        "object_box": object_box
                     })
             
             if not gt_pairs:
@@ -698,20 +1021,22 @@ def evaluate_grounding_task(
             
             image = Image.open(image_path).convert("RGB")
             
-            # Create prompt (matching training format)
+            # Create prompt with structured image content for Qwen3-VL
             user_prompt = create_grounding_prompt(action, object_category)
+            user_content = create_grounding_prompt_with_image(action, object_category, image)
             
             messages = [
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt}
+                {"role": "user", "content": user_content}
             ]
             
-            text = processor.tokenizer.apply_chat_template(
+            # Use processor's apply_chat_template which handles images properly
+            text = processor.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True
             )
             
             inputs = processor(
-                text=text, 
+                text=[text], 
                 images=[image], 
                 return_tensors="pt",
                 truncation=True,
@@ -728,7 +1053,11 @@ def evaluate_grounding_task(
                     pad_token_id=processor.tokenizer.pad_token_id,
                 )
             
-            generated = processor.decode(outputs[0], skip_special_tokens=True)
+            # Decode only the newly generated tokens (after the input prompt)
+            generated = processor.decode(
+                outputs[0][inputs['input_ids'].shape[1]:], 
+                skip_special_tokens=True
+            )
             pred_pairs = parse_box_predictions(generated, (img_height, img_width))
             
             results.append({
@@ -876,6 +1205,9 @@ def print_metrics(metrics: Dict, title: str = "Evaluation Results"):
         'verb_match': 'First word (verb) match',
         'word_overlap': 'Jaccard word similarity',
         'non_empty': 'Non-empty prediction rate',
+        'bertscore_precision': 'BERTScore Precision',
+        'bertscore_recall': 'BERTScore Recall',
+        'bertscore_f1': 'BERTScore F1',
         'AR': 'Average Recall @ IoU=0.50:0.95',
         'AR@0.5': 'Average Recall @ IoU=0.50',
         'AR@0.75': 'Average Recall @ IoU=0.75',
@@ -885,12 +1217,18 @@ def print_metrics(metrics: Dict, title: str = "Evaluation Results"):
         'num_samples': 'Total samples evaluated',
     }
     
+    # Metrics to display as percentages
+    percentage_metrics = [
+        'METEOR', 'CIDEr', 'BLEU_1', 'BLEU_2', 'BLEU_3', 'BLEU_4', 
+        'ROUGE_L', 'exact_match', 'verb_match', 'word_overlap', 'non_empty',
+        'bertscore_precision', 'bertscore_recall', 'bertscore_f1',
+        'AR', 'AR@0.5', 'AR@0.75', 'ARs', 'ARm', 'ARl'
+    ]
+    
     for key, value in metrics.items():
         desc = descriptions.get(key, '')
         if isinstance(value, float):
-            if key in ['METEOR', 'CIDEr', 'BLEU_1', 'BLEU_2', 'BLEU_3', 'BLEU_4', 
-                       'ROUGE_L', 'exact_match', 'verb_match', 'word_overlap', 'non_empty',
-                       'AR', 'AR@0.5', 'AR@0.75', 'ARs', 'ARm', 'ARl']:
+            if key in percentage_metrics:
                 print(f"{key:<20} {value*100:>9.2f}%  {desc:<35}")
             else:
                 print(f"{key:<20} {value:>10.4f}  {desc:<35}")
@@ -1009,6 +1347,13 @@ def main():
         help="Path to trained model"
     )
     parser.add_argument(
+        "--model_type",
+        type=str,
+        default="auto",
+        choices=["auto", "spatial_linking", "base"],
+        help="Model type: 'auto' (detect), 'spatial_linking' (with spatial module), 'base' (standard Qwen3-VL with LoRA)"
+    )
+    parser.add_argument(
         "--test_file",
         type=str,
         required=True,
@@ -1068,6 +1413,7 @@ def main():
     print(" Spatial Linking HOI Model Evaluation")
     print("=" * 70)
     print(f"  Model:       {args.model_path}")
+    print(f"  Model type:  {args.model_type}")
     print(f"  Test file:   {args.test_file}")
     print(f"  Task:        {args.task_type}")
     print(f"  Max samples: {args.max_samples or 'all'}")
@@ -1076,7 +1422,7 @@ def main():
     print("=" * 70 + "\n")
     
     # Load model
-    model, processor = load_model(args.model_path)
+    model, processor = load_model(args.model_path, model_type=args.model_type)
     
     # Load test data
     test_data = load_test_data(args.test_file)
