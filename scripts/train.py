@@ -205,6 +205,14 @@ def setup_model(config: Dict):
         attn_implementation="sdpa",  # Use PyTorch's native SDPA (flash-attn requires CUDA 12.x)
     )
     
+    # Verify spatial_linking module exists
+    if not hasattr(model, 'spatial_linking'):
+        raise RuntimeError(
+            "Model does not have spatial_linking module! "
+            "Make sure SpatialLinkingInteractionModel is correctly defined."
+        )
+    logger.info(f"Spatial linking module loaded: {type(model.spatial_linking).__name__}")
+    
     # Set loss_type to avoid warning (set it regardless of whether it exists)
     model.config.loss_type = "ForCausalLMLoss"
     
@@ -238,10 +246,29 @@ def setup_model(config: Dict):
         model.print_trainable_parameters()
     
     # Ensure spatial linking is trainable
+    # After PEFT wrapping, spatial_linking is at model.base_model.model.spatial_linking
     if config.get("train_spatial_linking", True):
         logger.info("Enabling spatial linking training")
-        for param in model.spatial_linking.parameters():
-            param.requires_grad = True
+        
+        # Find spatial_linking module in potentially PEFT-wrapped model
+        spatial_linking_module = None
+        if hasattr(model, 'spatial_linking'):
+            spatial_linking_module = model.spatial_linking
+        elif hasattr(model, 'base_model'):
+            if hasattr(model.base_model, 'model') and hasattr(model.base_model.model, 'spatial_linking'):
+                spatial_linking_module = model.base_model.model.spatial_linking
+            elif hasattr(model.base_model, 'spatial_linking'):
+                spatial_linking_module = model.base_model.spatial_linking
+        
+        if spatial_linking_module is not None:
+            trainable_count = 0
+            for name, param in spatial_linking_module.named_parameters():
+                param.requires_grad = True
+                trainable_count += param.numel()
+            logger.info(f"  Spatial linking trainable parameters: {trainable_count:,}")
+        else:
+            logger.error("Could not find spatial_linking module in model structure!")
+            raise RuntimeError("spatial_linking module not found - check model architecture")
     
     return model, processor
 
@@ -313,6 +340,40 @@ def setup_dataset(config: Dict, processor):
 # =============================================================================
 
 from transformers import TrainerCallback
+
+class SpatialLinkingSaveCallback(TrainerCallback):
+    """Callback to save spatial_linking module weights with each checkpoint."""
+    
+    def on_save(self, args, state, control, **kwargs):
+        """Save spatial_linking weights alongside the checkpoint."""
+        import os
+        
+        # Get the checkpoint directory that was just saved
+        checkpoint_dir = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
+        
+        if not os.path.exists(checkpoint_dir):
+            return
+        
+        model = kwargs.get('model')
+        if model is None:
+            return
+        
+        # Extract spatial_linking state dict
+        spatial_linking_state = None
+        if hasattr(model, 'base_model'):
+            base_model = model.base_model
+            if hasattr(base_model, 'model') and hasattr(base_model.model, 'spatial_linking'):
+                spatial_linking_state = base_model.model.spatial_linking.state_dict()
+            elif hasattr(base_model, 'spatial_linking'):
+                spatial_linking_state = base_model.spatial_linking.state_dict()
+        elif hasattr(model, 'spatial_linking'):
+            spatial_linking_state = model.spatial_linking.state_dict()
+        
+        if spatial_linking_state is not None:
+            spatial_linking_path = os.path.join(checkpoint_dir, "spatial_linking.pt")
+            torch.save(spatial_linking_state, spatial_linking_path)
+            logger.debug(f"Saved spatial_linking weights to {spatial_linking_path}")
+
 
 class FileLoggingCallback(TrainerCallback):
     """Callback to log training progress to file."""
@@ -524,8 +585,9 @@ def train(config: Dict, resume_from_checkpoint: str = None, resume_run_id: str =
         max_length=config.get("cutoff_len", 2048),
     )
     
-    # Create file logging callback
+    # Create callbacks
     file_callback = FileLoggingCallback(log_file)
+    spatial_save_callback = SpatialLinkingSaveCallback()
     
     # Create trainer
     trainer = SFTTrainer(
@@ -535,7 +597,7 @@ def train(config: Dict, resume_from_checkpoint: str = None, resume_run_id: str =
         eval_dataset=eval_dataset,
         data_collator=collator,
         processing_class=processor,
-        callbacks=[file_callback],
+        callbacks=[file_callback, spatial_save_callback],
     )
     
     # Train (with optional resume)
@@ -551,6 +613,32 @@ def train(config: Dict, resume_from_checkpoint: str = None, resume_run_id: str =
     # Save final model
     logger.info(f"Saving model to {output_dir}")
     trainer.save_model()
+    
+    # IMPORTANT: Save spatial linking module weights separately
+    # PEFT's save_model() only saves LoRA adapters, not custom modules
+    spatial_linking_path = os.path.join(output_dir, "spatial_linking.pt")
+    
+    # Handle PEFT wrapped model - need to access base model
+    if hasattr(model, 'base_model'):
+        # PEFT model - get the underlying model
+        base_model = model.base_model
+        if hasattr(base_model, 'model') and hasattr(base_model.model, 'spatial_linking'):
+            spatial_linking_state = base_model.model.spatial_linking.state_dict()
+        elif hasattr(base_model, 'spatial_linking'):
+            spatial_linking_state = base_model.spatial_linking.state_dict()
+        else:
+            logger.warning("Could not find spatial_linking in PEFT model structure")
+            spatial_linking_state = None
+    elif hasattr(model, 'spatial_linking'):
+        spatial_linking_state = model.spatial_linking.state_dict()
+    else:
+        logger.warning("Could not find spatial_linking module")
+        spatial_linking_state = None
+    
+    if spatial_linking_state is not None:
+        torch.save(spatial_linking_state, spatial_linking_path)
+        logger.info(f"Saved spatial linking weights to {spatial_linking_path}")
+        logger.info(f"  Keys saved: {list(spatial_linking_state.keys())}")
     
     # Save training metrics
     metrics = train_result.metrics

@@ -237,6 +237,11 @@ def visualize_multi_region_attention(
     if not HAS_MATPLOTLIB:
         raise ImportError("matplotlib is required for visualization")
     
+    # Handle empty attention list
+    if not attention_info_list or len(attention_info_list) == 0:
+        warnings.warn("No attention info provided for visualization")
+        return None
+    
     # Load image if needed
     if isinstance(image, (str, Path)):
         if not HAS_PIL:
@@ -254,8 +259,10 @@ def visualize_multi_region_attention(
     n_regions = len(attention_info_list)
     fig, axes = plt.subplots(1, n_regions + 1, figsize=figsize)
     
+    # Ensure axes is always iterable
     if n_regions == 0:
-        return fig
+        plt.close(fig)
+        return None
     
     # Box type colors
     box_colors = {

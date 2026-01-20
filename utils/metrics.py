@@ -5,13 +5,16 @@ Ported from hoi-benchmarks for consistent evaluation.
 
 Provides:
 - Grounding metrics: AR (Average Recall) at various IoU thresholds
-- Referring metrics: BERTScore for action description matching
+- Referring metrics: METEOR, CIDEr, BLEU, ROUGE-L (COCO caption metrics)
 
 Reference:
-- hoi-benchmarks/recalculate_ground_metrics.py
-- hoi-benchmarks/calculate_bertscore.py
+- hoi-benchmarks/eval_swig_ground_qwen3vl.py
+- hoi-benchmarks/eval_swig_action_referring_qwen3vl.py
 """
 
+import os
+import json
+import tempfile
 import numpy as np
 from typing import Dict, List, Tuple, Optional, Union
 import logging
@@ -147,6 +150,26 @@ def match_pairs_greedy(
     return matches, matched_preds, matched_gts
 
 
+def normalize_pair_format(pair: Union[Dict, List]) -> Dict:
+    """
+    Normalize pair format to standard dict with 'person_box' and 'object_box'.
+    
+    Handles:
+    - Dict with 'person_box'/'object_box'
+    - Dict with 'person_bbox'/'object_bbox'
+    - List format (shouldn't happen but handle gracefully)
+    """
+    if isinstance(pair, dict):
+        return {
+            'person_box': pair.get('person_box', pair.get('person_bbox', [])),
+            'object_box': pair.get('object_box', pair.get('object_bbox', []))
+        }
+    elif isinstance(pair, list):
+        # Assume it's a flat list or already in some format
+        return {'person_box': [], 'object_box': []}
+    return {'person_box': [], 'object_box': []}
+
+
 def compute_grounding_metrics(results: List[Dict]) -> Dict[str, float]:
     """
     Compute COCO-style Average Recall metrics for grounding task.
@@ -178,6 +201,14 @@ def compute_grounding_metrics(results: List[Dict]) -> Dict[str, float]:
     for r in results:
         pred_pairs = r.get('predicted_pairs', r.get('pairs', []))
         gt_pairs = r.get('gt_pairs', [])
+        
+        # Normalize to list of dicts
+        if isinstance(pred_pairs, list):
+            pred_pairs = [normalize_pair_format(p) for p in pred_pairs]
+        
+        if isinstance(gt_pairs, list):
+            gt_pairs = [normalize_pair_format(p) for p in gt_pairs]
+        
         predictions.append({'pairs': pred_pairs})
         ground_truths.append({'pairs': gt_pairs})
     
@@ -272,8 +303,8 @@ def compute_grounding_metrics(results: List[Dict]) -> Dict[str, float]:
 
 
 def evaluate_grounding(
-    predictions: List[Dict], 
-    ground_truths: List[Dict]
+    predictions: List[Union[Dict, List]], 
+    ground_truths: List[Union[Dict, List]]
 ) -> Dict[str, float]:
     """
     Evaluate grounding predictions against ground truths.
@@ -281,35 +312,51 @@ def evaluate_grounding(
     Convenience wrapper that formats inputs for compute_grounding_metrics.
     
     Args:
-        predictions: List of prediction dicts with 'pairs' key
-        ground_truths: List of ground truth dicts with 'pairs' key
+        predictions: List of prediction dicts/lists with pairs
+        ground_truths: List of ground truth dicts/lists with pairs
         
     Returns:
         Dict of metrics
     """
     results = []
     for pred, gt in zip(predictions, ground_truths):
+        # Handle various input formats
+        if isinstance(pred, dict):
+            pred_pairs = pred.get('pairs', [])
+        elif isinstance(pred, list):
+            pred_pairs = pred
+        else:
+            pred_pairs = []
+        
+        if isinstance(gt, dict):
+            gt_pairs = gt.get('pairs', [])
+        elif isinstance(gt, list):
+            gt_pairs = gt
+        else:
+            gt_pairs = []
+        
         results.append({
-            'predicted_pairs': pred.get('pairs', pred),
-            'gt_pairs': gt.get('pairs', gt)
+            'predicted_pairs': pred_pairs,
+            'gt_pairs': gt_pairs
         })
     
     return compute_grounding_metrics(results)
 
 
 # =============================================================================
-# REFERRING METRICS (BERTScore)
+# REFERRING METRICS (COCO Caption Metrics)
 # =============================================================================
 
 def clean_text(text: str) -> str:
     """
-    Clean prediction/reference text for more accurate BERTScore calculation.
+    Clean prediction/reference text for evaluation.
     
     Handles:
     - Markdown bold: **text** -> text
     - Markdown italic: *text* -> text
     - Extra whitespace and newlines
     - Empty or None values
+    - Common prefixes from model outputs
     """
     import re
     
@@ -330,10 +377,148 @@ def clean_text(text: str) -> str:
     # Remove code blocks
     text = re.sub(r'`([^`]+)`', r'\1', text)
     
+    # Remove common prefixes
+    prefixes_to_remove = [
+        "the person is ",
+        "person is ",
+        "they are ",
+        "action: ",
+        "answer: ",
+        "output: ",
+    ]
+    
+    text_lower = text.lower()
+    for prefix in prefixes_to_remove:
+        if text_lower.startswith(prefix):
+            text = text[len(prefix):].strip()
+            text_lower = text.lower()
+    
+    # Remove trailing punctuation
+    text = text.rstrip('.!?,;:')
+    
     # Remove extra whitespace
     text = ' '.join(text.split())
     
-    return text.strip()
+    return text.strip().lower()
+
+
+def evaluate_referring_coco(
+    predictions: List[str],
+    references: List[str],
+    clean: bool = True,
+) -> Dict[str, float]:
+    """
+    Evaluate referring predictions using COCO caption metrics.
+    
+    Uses pycocoevalcap to compute:
+    - BLEU-1, BLEU-2, BLEU-3, BLEU-4
+    - METEOR
+    - ROUGE-L
+    - CIDEr
+    
+    Args:
+        predictions: List of predicted action strings
+        references: List of ground truth action strings
+        clean: Whether to clean text before scoring
+        
+    Returns:
+        Dict with all metrics
+    """
+    try:
+        from pycocotools.coco import COCO
+        from pycocoevalcap.eval import COCOEvalCap
+    except ImportError:
+        logger.warning("pycocoevalcap not installed. Install with: pip install pycocoevalcap")
+        return evaluate_referring_simple(predictions, references)
+    
+    if len(predictions) == 0:
+        return {
+            "BLEU_1": 0.0, "BLEU_2": 0.0, "BLEU_3": 0.0, "BLEU_4": 0.0,
+            "METEOR": 0.0, "ROUGE_L": 0.0, "CIDEr": 0.0, "exact_match": 0.0
+        }
+    
+    # Clean text if requested
+    if clean:
+        predictions = [clean_text(p) for p in predictions]
+        references = [clean_text(r) for r in references]
+    
+    # Create ground truth annotations in COCO format
+    annotations = []
+    images_info = []
+    for idx, ref in enumerate(references):
+        images_info.append({'id': idx})
+        annotations.append({
+            'image_id': idx,
+            'caption': ref,
+            'id': idx
+        })
+    
+    # Create predictions in COCO format
+    pred_annotations = []
+    for idx, pred in enumerate(predictions):
+        pred_annotations.append({
+            'image_id': idx,
+            'caption': pred
+        })
+    
+    # Create temporary files for COCO evaluation
+    gt_coco_format = {
+        'info': {
+            'description': 'HOI Action Referring Ground Truth',
+            'version': '1.0',
+            'year': 2025
+        },
+        'licenses': [{'id': 1, 'name': 'Unknown', 'url': ''}],
+        'images': images_info,
+        'annotations': annotations,
+        'type': 'captions'
+    }
+    
+    # Write to temp files
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+        json.dump(gt_coco_format, f)
+        gt_file = f.name
+    
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+        json.dump(pred_annotations, f)
+        pred_file = f.name
+    
+    try:
+        # Run COCO evaluation
+        # Suppress COCO output
+        import sys
+        from io import StringIO
+        old_stdout = sys.stdout
+        sys.stdout = StringIO()
+        
+        coco = COCO(gt_file)
+        coco_result = coco.loadRes(pred_file)
+        coco_eval = COCOEvalCap(coco, coco_result)
+        coco_eval.evaluate()
+        
+        sys.stdout = old_stdout
+        
+        # Extract metrics
+        metrics = {}
+        for metric, score in coco_eval.eval.items():
+            metrics[metric] = float(score)
+        
+        # Add exact match accuracy
+        exact_matches = sum(1 for p, r in zip(predictions, references) if p == r)
+        metrics['exact_match'] = exact_matches / len(predictions) if len(predictions) > 0 else 0.0
+        
+    except Exception as e:
+        logger.warning(f"COCO evaluation failed: {e}. Using simple metrics.")
+        metrics = evaluate_referring_simple(predictions, references)
+    finally:
+        # Clean up temp files
+        try:
+            os.unlink(gt_file)
+            os.unlink(pred_file)
+        except:
+            pass
+    
+    return metrics
 
 
 def evaluate_referring(
@@ -345,7 +530,10 @@ def evaluate_referring(
     clean: bool = True,
 ) -> Dict[str, float]:
     """
-    Evaluate referring predictions using BERTScore.
+    Evaluate referring predictions using BERTScore (legacy).
+    
+    NOTE: This is kept for backwards compatibility.
+    Use evaluate_referring_coco() for METEOR, CIDEr, BLEU, ROUGE-L metrics.
     
     Args:
         predictions: List of predicted action strings
@@ -361,21 +549,24 @@ def evaluate_referring(
     try:
         from bert_score import score as bert_score
     except ImportError:
-        logger.error("bert_score not installed. Install with: pip install bert_score")
-        return {"precision": 0.0, "recall": 0.0, "f1": 0.0}
+        logger.warning("bert_score not installed. Using COCO metrics instead.")
+        return evaluate_referring_coco(predictions, references, clean)
     
     if len(predictions) == 0:
         return {"precision": 0.0, "recall": 0.0, "f1": 0.0}
     
     # Clean text if requested
     if clean:
-        predictions = [clean_text(p) for p in predictions]
-        references = [clean_text(r) for r in references]
+        predictions_clean = [clean_text(p) for p in predictions]
+        references_clean = [clean_text(r) for r in references]
+    else:
+        predictions_clean = predictions
+        references_clean = references
     
     # Compute BERTScore
     P, R, F1 = bert_score(
-        predictions,
-        references,
+        predictions_clean,
+        references_clean,
         model_type=model_type,
         batch_size=batch_size,
         device=device,
@@ -399,34 +590,59 @@ def evaluate_referring_simple(
     references: List[str],
 ) -> Dict[str, float]:
     """
-    Simple exact match evaluation for referring task.
+    Simple evaluation for referring task without external dependencies.
     
-    Useful for quick evaluation without BERTScore dependency.
+    Metrics:
+    - exact_match: Exact string match
+    - verb_match: First word (verb) matches
+    - word_overlap: Jaccard similarity of words
+    - non_empty: Percentage of non-empty predictions
     """
     if len(predictions) == 0:
-        return {"exact_match": 0.0, "verb_match": 0.0}
+        return {"exact_match": 0.0, "verb_match": 0.0, "word_overlap": 0.0, "non_empty": 0.0}
     
     exact_matches = 0
     verb_matches = 0
+    word_overlaps = []
+    non_empty = 0
     
     for pred, ref in zip(predictions, references):
         pred_clean = clean_text(pred).lower()
         ref_clean = clean_text(ref).lower()
+        
+        # Track non-empty predictions
+        if pred_clean:
+            non_empty += 1
         
         # Exact match
         if pred_clean == ref_clean:
             exact_matches += 1
         
         # Verb match (first word)
-        pred_verb = pred_clean.split()[0] if pred_clean else ""
-        ref_verb = ref_clean.split()[0] if ref_clean else ""
+        pred_words = pred_clean.split() if pred_clean else []
+        ref_words = ref_clean.split() if ref_clean else []
         
-        if pred_verb == ref_verb:
+        pred_verb = pred_words[0] if pred_words else ""
+        ref_verb = ref_words[0] if ref_words else ""
+        
+        if pred_verb and ref_verb and pred_verb == ref_verb:
             verb_matches += 1
+        
+        # Word overlap (Jaccard similarity)
+        if pred_words and ref_words:
+            pred_set = set(pred_words)
+            ref_set = set(ref_words)
+            intersection = len(pred_set & ref_set)
+            union = len(pred_set | ref_set)
+            word_overlaps.append(intersection / union if union > 0 else 0.0)
+        else:
+            word_overlaps.append(0.0)
     
     return {
         "exact_match": exact_matches / len(predictions),
         "verb_match": verb_matches / len(predictions),
+        "word_overlap": sum(word_overlaps) / len(word_overlaps) if word_overlaps else 0.0,
+        "non_empty": non_empty / len(predictions),
     }
 
 
@@ -463,11 +679,11 @@ def evaluate_hoi_results(
             references = [r.get("ground_truth", "") for r in referring_results]
             
             if predictions and references:
-                # Try BERTScore first
+                # Use COCO metrics
                 try:
-                    referring_metrics = evaluate_referring(predictions, references)
+                    referring_metrics = evaluate_referring_coco(predictions, references)
                 except Exception as e:
-                    logger.warning(f"BERTScore failed, using simple metrics: {e}")
+                    logger.warning(f"COCO evaluation failed, using simple metrics: {e}")
                     referring_metrics = evaluate_referring_simple(predictions, references)
                 
                 metrics.update({f"referring/{k}": v for k, v in referring_metrics.items()})

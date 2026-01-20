@@ -1,5 +1,6 @@
 wandb/
 outputs/
+eval_results/
 __pycache__/
 .DS_Store
 .env
