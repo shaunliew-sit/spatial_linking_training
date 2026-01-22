@@ -350,6 +350,12 @@ class SpatialLinkingInteractionModel(Qwen3VLForConditionalGeneration):
                         inputs_embeds = spatial_output
         
         # Call parent forward with embeddings
+        # #region agent log - Hypothesis D: Track super().forward() call
+        import json as _json
+        _log_data = {"inputs_embeds_is_none": inputs_embeds is None, "inputs_embeds_shape": str(inputs_embeds.shape) if inputs_embeds is not None else "None"}
+        with open("/workspace/.cursor/debug.log", "a") as _f:
+            _f.write(_json.dumps({"location": "spatial_model.py:forward:super_call", "hypothesisId": "D", "message": "Calling super().forward() with inputs_embeds", "data": _log_data, "timestamp": __import__("time").time()}) + "\n")
+        # #endregion
         return super().forward(
             input_ids=None,  # Use inputs_embeds instead
             attention_mask=attention_mask,

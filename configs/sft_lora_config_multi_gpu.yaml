@@ -58,11 +58,11 @@ learning_rate: 2.0e-5
 
 # Epochs and batch size
 # Per-GPU batch size x num_GPUs x gradient_accumulation = effective batch
-# Example: 10 x 8 x 2 = 160 effective batch size
+# Updated: 24 x 8 x 1 = 192 effective batch size (optimized for speed, ~82% mem usage)
 num_train_epochs: 3
-per_device_train_batch_size: 10     # Per GPU (optimized for 144GB H200)
-per_device_eval_batch_size: 10
-gradient_accumulation_steps: 2      # Effective batch = 10 * 8 * 2 = 160
+per_device_train_batch_size: 24     # Per GPU (est. ~118 GB peak, 82% usage - safe)
+per_device_eval_batch_size: 24
+gradient_accumulation_steps: 1      # Removed accumulation for 2x speed
 
 # Optimizer
 optim: adamw_torch
