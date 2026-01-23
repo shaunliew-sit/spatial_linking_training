@@ -300,6 +300,107 @@ class ZoomInTool:
 
 
 # =============================================================================
+# CHECKPOINT FUNCTIONS FOR RESUME SUPPORT
+# =============================================================================
+
+def get_checkpoint_path(checkpoint_dir: str, task_type: str, test_file: str) -> Path:
+    """
+    Get the checkpoint file path based on task and test file.
+    
+    Args:
+        checkpoint_dir: Directory for checkpoints
+        task_type: 'referring' or 'grounding'
+        test_file: Path to test file (used to create unique checkpoint name)
+    
+    Returns:
+        Path to checkpoint file
+    """
+    # Create a unique checkpoint name based on test file
+    test_name = Path(test_file).stem
+    checkpoint_name = f"checkpoint_{task_type}_{test_name}.json"
+    return Path(checkpoint_dir) / checkpoint_name
+
+
+def load_checkpoint(checkpoint_path: Path) -> Tuple[int, List[Dict], List[str], List[str]]:
+    """
+    Load checkpoint from file.
+    
+    Args:
+        checkpoint_path: Path to checkpoint file
+    
+    Returns:
+        Tuple of (start_idx, detailed_results, predictions, references)
+    """
+    if not checkpoint_path.exists():
+        return 0, [], [], []
+    
+    try:
+        with open(checkpoint_path, 'r') as f:
+            checkpoint = json.load(f)
+        
+        start_idx = checkpoint.get('last_processed_idx', 0) + 1
+        detailed_results = checkpoint.get('detailed_results', [])
+        predictions = checkpoint.get('predictions', [])
+        references = checkpoint.get('references', [])
+        
+        logger.info(f"Loaded checkpoint: {len(detailed_results)} samples processed, resuming from index {start_idx}")
+        return start_idx, detailed_results, predictions, references
+    except Exception as e:
+        logger.warning(f"Failed to load checkpoint: {e}. Starting from scratch.")
+        return 0, [], [], []
+
+
+def save_checkpoint(
+    checkpoint_path: Path,
+    last_processed_idx: int,
+    detailed_results: List[Dict],
+    predictions: List[str] = None,
+    references: List[str] = None,
+    results: List[Dict] = None,
+):
+    """
+    Save checkpoint to file.
+    
+    Args:
+        checkpoint_path: Path to save checkpoint
+        last_processed_idx: Index of last processed sample
+        detailed_results: List of detailed result dicts
+        predictions: List of predictions (for referring task)
+        references: List of references (for referring task)
+        results: List of result dicts (for grounding task)
+    """
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    checkpoint = {
+        'last_processed_idx': last_processed_idx,
+        'detailed_results': detailed_results,
+        'timestamp': datetime.now().isoformat(),
+    }
+    
+    if predictions is not None:
+        checkpoint['predictions'] = predictions
+    if references is not None:
+        checkpoint['references'] = references
+    if results is not None:
+        checkpoint['results'] = results
+    
+    # Write to temp file first, then rename (atomic write)
+    temp_path = checkpoint_path.with_suffix('.tmp')
+    with open(temp_path, 'w') as f:
+        json.dump(checkpoint, f)
+    temp_path.rename(checkpoint_path)
+    
+    logger.info(f"Checkpoint saved: {last_processed_idx + 1} samples processed")
+
+
+def delete_checkpoint(checkpoint_path: Path):
+    """Delete checkpoint file after successful completion."""
+    if checkpoint_path.exists():
+        checkpoint_path.unlink()
+        logger.info(f"Checkpoint deleted: {checkpoint_path}")
+
+
+# =============================================================================
 # VLLM CLIENT FUNCTIONS
 # =============================================================================
 
@@ -1879,6 +1980,9 @@ def evaluate_referring_task_vllm(
     model_name: str,
     max_samples: Optional[int] = None,
     verbose: bool = False,
+    resume: bool = False,
+    checkpoint_interval: int = 100,
+    checkpoint_path: Optional[Path] = None,
 ) -> Tuple[Dict, List[Dict]]:
     """
     Evaluate on referring task using vLLM server with real tool calling.
@@ -1890,6 +1994,9 @@ def evaluate_referring_task_vllm(
         model_name: Model name in vLLM
         max_samples: Maximum samples to evaluate
         verbose: Show detailed output
+        resume: Whether to resume from checkpoint
+        checkpoint_interval: Save checkpoint every N samples
+        checkpoint_path: Path to checkpoint file
     
     Returns:
         Tuple of (metrics dict, detailed results list)
@@ -1899,6 +2006,13 @@ def evaluate_referring_task_vllm(
     predictions = []
     references = []
     detailed_results = []
+    start_idx = 0
+    
+    # Load checkpoint if resuming
+    if resume and checkpoint_path:
+        start_idx, detailed_results, predictions, references = load_checkpoint(checkpoint_path)
+        if start_idx > 0:
+            logger.info(f"Resuming from sample {start_idx} with {len(detailed_results)} already processed")
     
     samples = test_data[:max_samples] if max_samples else test_data
     
@@ -1909,9 +2023,13 @@ def evaluate_referring_task_vllm(
     if not check_vllm_health(vllm_endpoint, model_name):
         raise RuntimeError(f"vLLM server not healthy or model '{model_name}' not available")
     
-    logger.info(f"Starting vLLM evaluation with {len(samples)} samples")
+    total_samples = len(samples)
+    logger.info(f"Starting vLLM evaluation with {total_samples} samples (starting from {start_idx})")
     
-    for idx, sample in enumerate(tqdm(samples, desc="Evaluating referring (vLLM)")):
+    for idx, sample in enumerate(tqdm(samples, desc="Evaluating referring (vLLM)", initial=start_idx, total=total_samples)):
+        # Skip already processed samples
+        if idx < start_idx:
+            continue
         try:
             # Get data
             file_name = sample["file_name"]
@@ -2015,9 +2133,38 @@ def evaluate_referring_task_vllm(
                     status = "✓ EXACT" if is_exact else ("~ PARTIAL" if is_partial else "✗ MISMATCH")
                     print(f"  Match Status: {status}")
             
+            # Save checkpoint periodically
+            if checkpoint_path and (idx + 1) % checkpoint_interval == 0:
+                save_checkpoint(
+                    checkpoint_path=checkpoint_path,
+                    last_processed_idx=idx,
+                    detailed_results=detailed_results,
+                    predictions=predictions,
+                    references=references,
+                )
+            
         except Exception as e:
             logger.warning(f"Error processing sample {idx}: {e}")
+            # Save checkpoint on error as well
+            if checkpoint_path and len(detailed_results) > 0:
+                save_checkpoint(
+                    checkpoint_path=checkpoint_path,
+                    last_processed_idx=idx - 1,
+                    detailed_results=detailed_results,
+                    predictions=predictions,
+                    references=references,
+                )
             continue
+    
+    # Save final checkpoint before computing metrics
+    if checkpoint_path and len(detailed_results) > 0:
+        save_checkpoint(
+            checkpoint_path=checkpoint_path,
+            last_processed_idx=len(samples) - 1,
+            detailed_results=detailed_results,
+            predictions=predictions,
+            references=references,
+        )
     
     # Compute metrics
     logger.info(f"Computing COCO caption metrics for {len(predictions)} samples...")
@@ -2030,6 +2177,10 @@ def evaluate_referring_task_vllm(
     
     metrics["num_samples"] = len(predictions)
     
+    # Delete checkpoint after successful completion
+    if checkpoint_path:
+        delete_checkpoint(checkpoint_path)
+    
     return metrics, detailed_results
 
 
@@ -2040,6 +2191,9 @@ def evaluate_grounding_task_vllm(
     model_name: str,
     max_samples: Optional[int] = None,
     verbose: bool = False,
+    resume: bool = False,
+    checkpoint_interval: int = 100,
+    checkpoint_path: Optional[Path] = None,
 ) -> Tuple[Dict, List[Dict]]:
     """
     Evaluate on grounding task using vLLM server with real tool calling.
@@ -2051,6 +2205,9 @@ def evaluate_grounding_task_vllm(
         model_name: Model name in vLLM
         max_samples: Maximum samples to evaluate
         verbose: Show detailed output
+        resume: Whether to resume from checkpoint
+        checkpoint_interval: Save checkpoint every N samples
+        checkpoint_path: Path to checkpoint file
     
     Returns:
         Tuple of (metrics dict, detailed results list)
@@ -2059,6 +2216,21 @@ def evaluate_grounding_task_vllm(
     
     results = []
     detailed_results = []
+    start_idx = 0
+    
+    # Load checkpoint if resuming
+    if resume and checkpoint_path:
+        if checkpoint_path.exists():
+            try:
+                with open(checkpoint_path, 'r') as f:
+                    checkpoint = json.load(f)
+                start_idx = checkpoint.get('last_processed_idx', 0) + 1
+                detailed_results = checkpoint.get('detailed_results', [])
+                results = checkpoint.get('results', [])
+                logger.info(f"Loaded checkpoint: {len(detailed_results)} samples processed, resuming from index {start_idx}")
+            except Exception as e:
+                logger.warning(f"Failed to load checkpoint: {e}. Starting from scratch.")
+                start_idx = 0
     
     samples = test_data[:max_samples] if max_samples else test_data
     
@@ -2069,9 +2241,13 @@ def evaluate_grounding_task_vllm(
     if not check_vllm_health(vllm_endpoint, model_name):
         raise RuntimeError(f"vLLM server not healthy or model '{model_name}' not available")
     
-    logger.info(f"Starting vLLM grounding evaluation with {len(samples)} samples")
+    total_samples = len(samples)
+    logger.info(f"Starting vLLM grounding evaluation with {total_samples} samples (starting from {start_idx})")
     
-    for idx, sample in enumerate(tqdm(samples, desc="Evaluating grounding (vLLM)")):
+    for idx, sample in enumerate(tqdm(samples, desc="Evaluating grounding (vLLM)", initial=start_idx, total=total_samples)):
+        # Skip already processed samples
+        if idx < start_idx:
+            continue
         try:
             file_name = sample["file_name"]
             action = sample["action"]
@@ -2229,9 +2405,35 @@ def evaluate_grounding_task_vllm(
                     else:
                         print(f"    --> NO MATCH (need both >= 0.5)")
             
+            # Save checkpoint periodically
+            if checkpoint_path and (idx + 1) % checkpoint_interval == 0:
+                save_checkpoint(
+                    checkpoint_path=checkpoint_path,
+                    last_processed_idx=idx,
+                    detailed_results=detailed_results,
+                    results=results,
+                )
+            
         except Exception as e:
             logger.warning(f"Error processing sample {idx}: {e}")
+            # Save checkpoint on error as well
+            if checkpoint_path and len(detailed_results) > 0:
+                save_checkpoint(
+                    checkpoint_path=checkpoint_path,
+                    last_processed_idx=idx - 1,
+                    detailed_results=detailed_results,
+                    results=results,
+                )
             continue
+    
+    # Save final checkpoint before computing metrics
+    if checkpoint_path and len(detailed_results) > 0:
+        save_checkpoint(
+            checkpoint_path=checkpoint_path,
+            last_processed_idx=len(samples) - 1,
+            detailed_results=detailed_results,
+            results=results,
+        )
     
     # Compute metrics
     logger.info(f"Computing grounding metrics for {len(results)} samples...")
@@ -2241,6 +2443,10 @@ def evaluate_grounding_task_vllm(
     )
     
     metrics["num_samples"] = len(results)
+    
+    # Delete checkpoint after successful completion
+    if checkpoint_path:
+        delete_checkpoint(checkpoint_path)
     
     return metrics, detailed_results
 
@@ -2637,6 +2843,7 @@ def save_results(
         f.write("=" * 80 + "\n")
         
         total = len(detailed_results)
+        has_tool = 0
         if total > 0:
             has_think = sum(1 for r in detailed_results if r.get('thinking'))
             has_tool = sum(1 for r in detailed_results if r.get('has_tool_call'))
@@ -2736,6 +2943,25 @@ def main():
         help="Show detailed per-sample output during evaluation"
     )
     
+    # Resume/checkpoint arguments
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from last checkpoint if available"
+    )
+    parser.add_argument(
+        "--checkpoint_interval",
+        type=int,
+        default=100,
+        help="Save checkpoint every N samples (default: 100)"
+    )
+    parser.add_argument(
+        "--checkpoint_dir",
+        type=str,
+        default="./eval_checkpoints",
+        help="Directory for checkpoint files (default: ./eval_checkpoints)"
+    )
+    
     # vLLM arguments
     parser.add_argument(
         "--use_vllm",
@@ -2761,6 +2987,9 @@ def main():
     if args.use_vllm and args.vllm_model is None:
         args.vllm_model = Path(args.model_path).name
     
+    # Get checkpoint path
+    checkpoint_path = get_checkpoint_path(args.checkpoint_dir, args.task_type, args.test_file)
+    
     # Print configuration
     print("\n" + "=" * 70)
     print(" Spatial Linking HOI Model Evaluation")
@@ -2778,6 +3007,9 @@ def main():
         print(f"  vLLM Model:  {args.vllm_model}")
     else:
         print(f"  Mode:        HuggingFace Local")
+    if args.resume:
+        print(f"  Resume:      Enabled (checkpoint: {checkpoint_path})")
+        print(f"  Checkpoint interval: {args.checkpoint_interval}")
     print("=" * 70 + "\n")
     
     # Load test data
@@ -2796,6 +3028,9 @@ def main():
                 model_name=args.vllm_model,
                 max_samples=args.max_samples,
                 verbose=args.verbose,
+                resume=args.resume,
+                checkpoint_interval=args.checkpoint_interval,
+                checkpoint_path=checkpoint_path,
             )
         else:
             metrics, detailed_results = evaluate_grounding_task_vllm(
@@ -2805,6 +3040,9 @@ def main():
                 model_name=args.vllm_model,
                 max_samples=args.max_samples,
                 verbose=args.verbose,
+                resume=args.resume,
+                checkpoint_interval=args.checkpoint_interval,
+                checkpoint_path=checkpoint_path,
             )
     else:
         # HuggingFace mode - load model locally
