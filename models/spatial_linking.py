@@ -178,6 +178,22 @@ class SpatialLinkingModule(nn.Module):
         batch_size, seq_len, hidden_dim = inputs_embeds.shape
         outputs = inputs_embeds.clone()
         
+        # #region agent log - Hypothesis D: Log spatial linking forward entry
+        import json as _json
+        import time as _time
+        _debug_data = {
+            "batch_size": batch_size,
+            "seq_len": seq_len,
+            "hidden_dim": hidden_dim,
+            "inputs_embeds_device": str(inputs_embeds.device),
+            "inputs_embeds_dtype": str(inputs_embeds.dtype),
+            "num_refer_boxes": len(refer_boxes) if refer_boxes else 0,
+            "refer_boxes_shapes": [list(b.shape) if b is not None else None for b in refer_boxes] if refer_boxes else [],
+        }
+        with open("/workspace/.cursor/debug.log", "a") as _f:
+            _f.write(_json.dumps({"location": "spatial_linking.py:forward:entry", "hypothesisId": "D", "message": "SpatialLinkingModule forward called", "data": _debug_data, "timestamp": _time.time()}) + "\n")
+        # #endregion
+        
         # Store attention info if requested
         all_attention_info = [] if output_attentions else None
         
@@ -269,6 +285,23 @@ class SpatialLinkingModule(nn.Module):
                 box_end_embed = inputs_embeds[b, box_end_pos, :].unsqueeze(0)  # [1, hidden_dim]
                 
                 # Cross-attention: <|box_end|> (Query) → patches (Key/Value)
+                # #region agent log - Hypothesis D: Log cross-attn input shapes/devices
+                import json as _json
+                import time as _time
+                _debug_ca = {
+                    "box_idx": i,
+                    "box_end_pos": box_end_pos,
+                    "query_shape": list(box_end_embed.unsqueeze(0).shape),
+                    "query_device": str(box_end_embed.device),
+                    "key_shape": list(patch_embeds.unsqueeze(0).shape),
+                    "key_device": str(patch_embeds.device),
+                    "num_patches": len(patch_indices),
+                    "cross_attn_weight_device": str(next(self.cross_attn.parameters()).device),
+                }
+                with open("/workspace/.cursor/debug.log", "a") as _f:
+                    _f.write(_json.dumps({"location": "spatial_linking.py:cross_attn:before", "hypothesisId": "D", "message": f"Cross-attn call for box {i}", "data": _debug_ca, "timestamp": _time.time()}) + "\n")
+                # #endregion
+                
                 linked_embed, attn_weights = self.cross_attn(
                     query=box_end_embed.unsqueeze(0),    # [1, 1, hidden_dim]
                     key=patch_embeds.unsqueeze(0),       # [1, num_patches, hidden_dim]
@@ -277,6 +310,11 @@ class SpatialLinkingModule(nn.Module):
                     average_attn_weights=False           # Keep per-head weights
                 )
                 linked_embed = linked_embed.squeeze(0).squeeze(0)  # [hidden_dim]
+                
+                # #region agent log - Hypothesis D: Log cross-attn success
+                with open("/workspace/.cursor/debug.log", "a") as _f:
+                    _f.write(_json.dumps({"location": "spatial_linking.py:cross_attn:after", "hypothesisId": "D", "message": f"Cross-attn completed for box {i}", "data": {"box_idx": i, "linked_embed_shape": list(linked_embed.shape)}, "timestamp": _time.time()}) + "\n")
+                # #endregion
                 
                 # Store attention info if requested
                 if output_attentions:

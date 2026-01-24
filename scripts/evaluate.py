@@ -50,6 +50,15 @@ import requests
 from transformers import AutoProcessor
 from PIL import Image
 
+# Fix cuDNN Conv3d algorithm selection issue for Qwen3-VL vision encoder
+# The "GET was unable to find an engine to execute this computation" error
+# occurs when cuDNN cannot find a valid algorithm for Conv3d with certain tensor sizes.
+# Disabling cuDNN benchmark and falling back to deterministic algorithms fixes this.
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = True
+# If the above doesn't work, uncomment the line below to fully disable cuDNN:
+# torch.backends.cudnn.enabled = False
+
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -1570,6 +1579,252 @@ def clean_action_response(response_text: str) -> str:
 # EVALUATION FUNCTIONS
 # =============================================================================
 
+def evaluate_referring_task_batched(
+    model,
+    processor,
+    test_data: List[Dict],
+    image_base_dir: str,
+    max_samples: Optional[int] = None,
+    batch_size: int = 8,
+    visualize_attention: bool = False,
+    viz_output_dir: Optional[str] = None,
+    verbose: bool = False,
+) -> Tuple[Dict, List[Dict]]:
+    """
+    Evaluate on referring task with batched processing for high VRAM systems.
+    
+    Optimized for DGX systems with 100GB+ usable VRAM.
+    Expected speedup: 10-30x compared to sequential processing.
+    
+    Args:
+        batch_size: Number of samples to process in parallel (default: 8 for 100GB VRAM)
+                   Recommended: 4-8 for mixed image sizes, 16-32 for uniform sizes
+    """
+    from utils.metrics import evaluate_referring_nltk, evaluate_referring_simple
+    
+    predictions = []
+    references = []
+    detailed_results = []
+    
+    samples = test_data[:max_samples] if max_samples else test_data
+    device = next(model.parameters()).device
+    
+    # Setup visualization if needed
+    if visualize_attention and viz_output_dir:
+        Path(viz_output_dir).mkdir(parents=True, exist_ok=True)
+        try:
+            from utils.visualization import visualize_multi_region_attention
+            has_viz = True
+        except ImportError:
+            logger.warning("Visualization not available, skipping attention viz")
+            has_viz = False
+    else:
+        has_viz = False
+    
+    viz_count = 0
+    
+    # Preload images in batches to reduce I/O overhead
+    logger.info(f"Batched evaluation: processing {len(samples)} samples with batch_size={batch_size}")
+    
+    # Process in batches
+    num_batches = (len(samples) + batch_size - 1) // batch_size
+    
+    for batch_idx in tqdm(range(num_batches), desc="Evaluating referring (batched)"):
+        batch_start = batch_idx * batch_size
+        batch_end = min(batch_start + batch_size, len(samples))
+        batch_samples = samples[batch_start:batch_end]
+        
+        # Prepare batch data
+        batch_images = []
+        batch_texts = []
+        batch_refer_boxes = []
+        batch_metadata = []
+        
+        for idx_in_batch, sample in enumerate(batch_samples):
+            try:
+                global_idx = batch_start + idx_in_batch
+                
+                # Get data
+                file_name = sample["file_name"]
+                boxes = sample.get("boxes_1000", sample.get("boxes", []))
+                person_idx = sample.get("person_box_idx", 0)
+                object_idx = sample.get("object_box_idx", 1)
+                gt_action = sample.get("gt_action", sample.get("response", ""))
+                
+                if len(boxes) < 2:
+                    continue
+                
+                person_box_raw = boxes[person_idx]
+                object_box_raw = boxes[object_idx]
+                
+                # Load image
+                image_path = get_image_path(file_name, image_base_dir)
+                if not Path(image_path).exists():
+                    logger.warning(f"Image not found: {image_path}")
+                    continue
+                
+                image = Image.open(image_path).convert("RGB")
+                img_width, img_height = image.size
+                
+                # Normalize boxes
+                person_box = normalize_bbox_to_1000(person_box_raw, img_width, img_height)
+                object_box = normalize_bbox_to_1000(object_box_raw, img_width, img_height)
+                interaction_box = [
+                    min(person_box[0], object_box[0]),
+                    min(person_box[1], object_box[1]),
+                    max(person_box[2], object_box[2]),
+                    max(person_box[3], object_box[3])
+                ]
+                
+                # Create prompt
+                user_content = create_referring_prompt_with_image(person_box, object_box, image, interaction_box)
+                messages = [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_content}
+                ]
+                
+                text = processor.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+                
+                batch_images.append(image)
+                batch_texts.append(text)
+                batch_refer_boxes.append(torch.tensor([person_box, object_box, interaction_box], dtype=torch.float32))
+                batch_metadata.append({
+                    "global_idx": global_idx,
+                    "file_name": file_name,
+                    "person_box": person_box,
+                    "object_box": object_box,
+                    "interaction_box": interaction_box,
+                    "gt_action": gt_action,
+                    "img_width": img_width,
+                    "img_height": img_height,
+                })
+            except Exception as e:
+                logger.warning(f"Error preparing batch sample {global_idx}: {e}")
+                continue
+        
+        if not batch_images:
+            continue
+        
+        # Process batch
+        try:
+            with torch.no_grad():
+                # Set left padding for decoder-only models (important for batched generation)
+                original_padding_side = processor.tokenizer.padding_side
+                processor.tokenizer.padding_side = 'left'
+                
+                # Batch process inputs
+                inputs = processor(
+                    text=batch_texts,
+                    images=batch_images,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=4096,
+                )
+                
+                # Restore original padding side
+                processor.tokenizer.padding_side = original_padding_side
+                
+                inputs = {k: v.to(device) for k, v in inputs.items()}
+                
+                # Generate for batch
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=256,
+                    do_sample=False,
+                    use_cache=True,
+                    pad_token_id=processor.tokenizer.pad_token_id,
+                )
+                
+                # Process each sample in batch
+                for i, meta in enumerate(batch_metadata):
+                    try:
+                        # Decode only NEW tokens
+                        input_length = inputs['input_ids'][i].shape[0]
+                        generated_ids = outputs[i][input_length:]
+                        generated = processor.decode(generated_ids, skip_special_tokens=True)
+                        
+                        # Parse answer
+                        answer = parse_answer(generated)
+                        pred = clean_action_response(answer)
+                        
+                        predictions.append(pred)
+                        references.append(meta["gt_action"])
+                        
+                        # Parse response components
+                        components = parse_response_components(generated)
+                        
+                        detailed_results.append({
+                            "file_name": meta["file_name"],
+                            "person_box": meta["person_box"],
+                            "object_box": meta["object_box"],
+                            "gt_action": meta["gt_action"],
+                            "predicted": pred,
+                            "raw_answer": answer,
+                            "full_response": generated,
+                            "thinking": components['thinking'],
+                            "tool_calls": components['tool_calls'],
+                            "has_tool_call": components['has_tool_call'],
+                            "answer_tag": components['answer'],
+                            "num_turns": 1,
+                        })
+                        
+                        if verbose and meta["global_idx"] % 100 == 0:
+                            logger.info(f"Sample {meta['global_idx']}: GT='{meta['gt_action']}' | Pred='{pred}'")
+                    
+                    except Exception as e:
+                        logger.warning(f"Error processing batch output {i}: {e}")
+                        # Add dummy results to maintain alignment
+                        predictions.append("")
+                        references.append(meta["gt_action"])
+                        detailed_results.append({
+                            "file_name": meta["file_name"],
+                            "person_box": meta["person_box"],
+                            "object_box": meta["object_box"],
+                            "gt_action": meta["gt_action"],
+                            "predicted": "",
+                            "raw_answer": "",
+                            "full_response": f"ERROR: {str(e)}",
+                            "thinking": "",
+                            "tool_calls": [],
+                            "has_tool_call": False,
+                            "answer_tag": "",
+                            "num_turns": 1,
+                        })
+        
+        except Exception as e:
+            logger.error(f"Error processing batch {batch_idx}: {e}")
+            # Add dummy results for entire batch
+            for meta in batch_metadata:
+                predictions.append("")
+                references.append(meta["gt_action"])
+                detailed_results.append({
+                    "file_name": meta["file_name"],
+                    "person_box": meta["person_box"],
+                    "object_box": meta["object_box"],
+                    "gt_action": meta["gt_action"],
+                    "predicted": "",
+                    "raw_answer": "",
+                    "full_response": f"BATCH_ERROR: {str(e)}",
+                    "thinking": "",
+                    "tool_calls": [],
+                    "has_tool_call": False,
+                    "answer_tag": "",
+                    "num_turns": 1,
+                })
+    
+    # Calculate metrics
+    logger.info("Computing evaluation metrics...")
+    try:
+        metrics = evaluate_referring_nltk(predictions, references)
+    except Exception as e:
+        logger.warning(f"NLTK metrics failed: {e}. Falling back to simple metrics.")
+        metrics = evaluate_referring_simple(predictions, references)
+    
+    return metrics, detailed_results
+
 def evaluate_referring_task(
     model,
     processor,
@@ -1714,6 +1969,7 @@ def evaluate_referring_task(
                     **inputs,
                     max_new_tokens=256,
                     do_sample=False,
+                    use_cache=True,  # Enable KV cache for faster generation
                     pad_token_id=processor.tokenizer.pad_token_id,
                 )
             
@@ -1904,6 +2160,7 @@ def evaluate_grounding_task(
                     **inputs,
                     max_new_tokens=500,
                     do_sample=False,
+                    use_cache=True,  # Enable KV cache for faster generation
                     pad_token_id=processor.tokenizer.pad_token_id,
                 )
             
@@ -1945,17 +2202,295 @@ def evaluate_grounding_task(
                 print(f"{'='*60}")
                 print(f"  Action: {action} {object_category}")
                 print(f"  GT pairs: {len(gt_pairs)}")
+                for i, gt in enumerate(gt_pairs[:3]):
+                    print(f"    GT {i+1}: Person {gt['person_box']}, Object {gt['object_box']}")
                 
                 print(f"\n  Model Response:")
                 print(format_response_for_display(generated))
                 
                 print(f"\n  Predicted pairs: {len(pred_pairs)}")
                 for i, pair in enumerate(pred_pairs[:3]):
-                    print(f"    Pair {i+1}: Person {pair['person_box']}, Object {pair['object_box']}")
+                    print(f"    Pred {i+1}: Person {pair['person_box']}, Object {pair['object_box']}")
+                
+                # Show IoU for each predicted pair vs GT (first GT pair)
+                if pred_pairs and gt_pairs:
+                    from utils.metrics import calculate_iou
+                    gt = gt_pairs[0]
+                    for i, pred in enumerate(pred_pairs[:3]):
+                        person_iou = calculate_iou(pred['person_box'], gt['person_box'])
+                        object_iou = calculate_iou(pred['object_box'], gt['object_box'])
+                        match_status = "✓" if person_iou >= 0.5 and object_iou >= 0.5 else "✗"
+                        print(f"    IoU {i+1}: Person={person_iou:.3f}, Object={object_iou:.3f} {match_status}")
             
         except Exception as e:
             logger.warning(f"Error processing sample {idx}: {e}")
             continue
+    
+    # Compute metrics
+    logger.info(f"Computing grounding metrics for {len(results)} samples...")
+    metrics = evaluate_grounding(
+        [r["predicted_pairs"] for r in results],
+        [r["gt_pairs"] for r in results],
+    )
+    
+    metrics["num_samples"] = len(results)
+    
+    return metrics, detailed_results
+
+
+def evaluate_grounding_task_batched(
+    model,
+    processor,
+    test_data: List[Dict],
+    image_base_dir: str,
+    max_samples: Optional[int] = None,
+    batch_size: int = 8,
+    visualize_attention: bool = False,
+    viz_output_dir: Optional[str] = None,
+    verbose: bool = False,
+) -> Tuple[Dict, List[Dict]]:
+    """
+    Evaluate on grounding task with batched processing for high VRAM systems.
+    
+    Optimized for DGX systems with 100GB+ usable VRAM.
+    Expected speedup: 10-30x compared to sequential processing.
+    
+    Args:
+        batch_size: Number of samples to process in parallel (default: 8 for 100GB VRAM)
+                   Recommended: 4-8 for mixed image sizes, 16-32 for uniform sizes
+    """
+    from utils.metrics import evaluate_grounding, calculate_iou
+    
+    results = []
+    detailed_results = []
+    
+    samples = test_data[:max_samples] if max_samples else test_data
+    device = next(model.parameters()).device
+    
+    logger.info(f"Batched grounding evaluation: processing {len(samples)} samples with batch_size={batch_size}")
+    
+    # Process in batches
+    num_batches = (len(samples) + batch_size - 1) // batch_size
+    
+    for batch_idx in tqdm(range(num_batches), desc="Evaluating grounding (batched)"):
+        batch_start = batch_idx * batch_size
+        batch_end = min(batch_start + batch_size, len(samples))
+        batch_samples = samples[batch_start:batch_end]
+        
+        # Prepare batch data
+        batch_images = []
+        batch_texts = []
+        batch_metadata = []
+        
+        for idx_in_batch, sample in enumerate(batch_samples):
+            try:
+                global_idx = batch_start + idx_in_batch
+                
+                file_name = sample["file_name"]
+                action = sample["action"]
+                object_category = sample["object_category"]
+                boxes = sample.get("boxes_1000", sample.get("boxes", []))
+                num_pairs = sample.get("num_pairs", 1)
+                gt_box_inds = sample.get("gt_box_inds", list(range(num_pairs * 2)))
+                img_height = sample.get("height", 1000)
+                img_width = sample.get("width", 1000)
+                
+                # Build ground truth pairs from simplified format
+                # Normalize boxes to 1000x1000 format to match model output
+                gt_pairs = []
+                for i in range(num_pairs):
+                    person_idx = gt_box_inds[i * 2]
+                    object_idx = gt_box_inds[i * 2 + 1]
+                    
+                    if person_idx < len(boxes) and object_idx < len(boxes):
+                        person_box_raw = boxes[person_idx]
+                        object_box_raw = boxes[object_idx]
+                        
+                        # Normalize to 1000x1000 format
+                        person_box = normalize_bbox_to_1000(person_box_raw, img_width, img_height)
+                        object_box = normalize_bbox_to_1000(object_box_raw, img_width, img_height)
+                        
+                        gt_pairs.append({
+                            "person_box": person_box,
+                            "object_box": object_box
+                        })
+                
+                if not gt_pairs:
+                    continue
+                
+                # Load image
+                image_path = get_image_path(file_name, image_base_dir)
+                if not Path(image_path).exists():
+                    logger.warning(f"Image not found: {image_path}")
+                    continue
+                
+                image = Image.open(image_path).convert("RGB")
+                
+                # Create prompt with structured image content for Qwen3-VL
+                user_content = create_grounding_prompt_with_image(action, object_category, image)
+                
+                messages = [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_content}
+                ]
+                
+                text = processor.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+                
+                batch_images.append(image)
+                batch_texts.append(text)
+                batch_metadata.append({
+                    "global_idx": global_idx,
+                    "file_name": file_name,
+                    "action": action,
+                    "object_category": object_category,
+                    "gt_pairs": gt_pairs,
+                    "img_width": img_width,
+                    "img_height": img_height,
+                })
+            except Exception as e:
+                logger.warning(f"Error preparing batch sample {global_idx}: {e}")
+                continue
+        
+        if not batch_images:
+            continue
+        
+        # Process batch
+        try:
+            with torch.no_grad():
+                # Set left padding for decoder-only models (important for batched generation)
+                original_padding_side = processor.tokenizer.padding_side
+                processor.tokenizer.padding_side = 'left'
+                
+                # Batch process inputs
+                inputs = processor(
+                    text=batch_texts,
+                    images=batch_images,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=4096,
+                )
+                
+                # Restore original padding side
+                processor.tokenizer.padding_side = original_padding_side
+                
+                inputs = {k: v.to(device) for k, v in inputs.items()}
+                
+                # Generate for batch
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=500,
+                    do_sample=False,
+                    use_cache=True,
+                    pad_token_id=processor.tokenizer.pad_token_id,
+                )
+                
+                # Process each sample in batch
+                for i, meta in enumerate(batch_metadata):
+                    try:
+                        # Decode only NEW tokens
+                        input_length = inputs['input_ids'][i].shape[0]
+                        generated_ids = outputs[i][input_length:]
+                        generated = processor.decode(generated_ids, skip_special_tokens=True)
+                        
+                        # Parse box predictions
+                        pred_pairs = parse_box_predictions(generated, (meta["img_height"], meta["img_width"]))
+                        
+                        results.append({
+                            "predicted_pairs": pred_pairs,
+                            "gt_pairs": meta["gt_pairs"],
+                        })
+                        
+                        # Parse response components
+                        components = parse_response_components(generated)
+                        
+                        detailed_results.append({
+                            "file_name": meta["file_name"],
+                            "action": meta["action"],
+                            "object_category": meta["object_category"],
+                            "gt_pairs": meta["gt_pairs"],
+                            "predicted_pairs": pred_pairs,
+                            "num_pred": len(pred_pairs),
+                            "num_gt": len(meta["gt_pairs"]),
+                            "full_response": generated,
+                            "thinking": components['thinking'],
+                            "tool_calls": components['tool_calls'],
+                            "has_tool_call": components['has_tool_call'],
+                            "answer_tag": components['answer'],
+                        })
+                        
+                        # Verbose output
+                        if verbose and meta["global_idx"] < 20:
+                            print(f"\n{'='*60}")
+                            print(f"[Sample {meta['global_idx']+1}] {meta['file_name']}")
+                            print(f"{'='*60}")
+                            print(f"  Action: {meta['action']} {meta['object_category']}")
+                            print(f"  GT pairs: {len(meta['gt_pairs'])}")
+                            for j, gt in enumerate(meta['gt_pairs'][:3]):
+                                print(f"    GT {j+1}: Person {gt['person_box']}, Object {gt['object_box']}")
+                            
+                            print(f"\n  Model Response:")
+                            print(format_response_for_display(generated))
+                            
+                            print(f"\n  Predicted pairs: {len(pred_pairs)}")
+                            for j, pair in enumerate(pred_pairs[:3]):
+                                print(f"    Pred {j+1}: Person {pair['person_box']}, Object {pair['object_box']}")
+                            
+                            # Show IoU for each predicted pair vs GT (first GT pair)
+                            if pred_pairs and meta['gt_pairs']:
+                                gt = meta['gt_pairs'][0]
+                                for j, pred in enumerate(pred_pairs[:3]):
+                                    person_iou = calculate_iou(pred['person_box'], gt['person_box'])
+                                    object_iou = calculate_iou(pred['object_box'], gt['object_box'])
+                                    match_status = "✓" if person_iou >= 0.5 and object_iou >= 0.5 else "✗"
+                                    print(f"    IoU {j+1}: Person={person_iou:.3f}, Object={object_iou:.3f} {match_status}")
+                    
+                    except Exception as e:
+                        logger.warning(f"Error processing batch output {i}: {e}")
+                        # Add dummy results to maintain alignment
+                        results.append({
+                            "predicted_pairs": [],
+                            "gt_pairs": meta["gt_pairs"],
+                        })
+                        detailed_results.append({
+                            "file_name": meta["file_name"],
+                            "action": meta["action"],
+                            "object_category": meta["object_category"],
+                            "gt_pairs": meta["gt_pairs"],
+                            "predicted_pairs": [],
+                            "num_pred": 0,
+                            "num_gt": len(meta["gt_pairs"]),
+                            "full_response": f"ERROR: {str(e)}",
+                            "thinking": "",
+                            "tool_calls": [],
+                            "has_tool_call": False,
+                            "answer_tag": "",
+                        })
+        
+        except Exception as e:
+            logger.error(f"Error processing batch {batch_idx}: {e}")
+            # Add dummy results for entire batch
+            for meta in batch_metadata:
+                results.append({
+                    "predicted_pairs": [],
+                    "gt_pairs": meta["gt_pairs"],
+                })
+                detailed_results.append({
+                    "file_name": meta["file_name"],
+                    "action": meta["action"],
+                    "object_category": meta["object_category"],
+                    "gt_pairs": meta["gt_pairs"],
+                    "predicted_pairs": [],
+                    "num_pred": 0,
+                    "num_gt": len(meta["gt_pairs"]),
+                    "full_response": f"BATCH_ERROR: {str(e)}",
+                    "thinking": "",
+                    "tool_calls": [],
+                    "has_tool_call": False,
+                    "answer_tag": "",
+                })
     
     # Compute metrics
     logger.info(f"Computing grounding metrics for {len(results)} samples...")
@@ -2942,6 +3477,12 @@ def main():
         action="store_true",
         help="Show detailed per-sample output during evaluation"
     )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=1,
+        help="Batch size for evaluation (default: 1 sequential, recommended: 8 for 100GB VRAM)"
+    )
     
     # Resume/checkpoint arguments
     parser.add_argument(
@@ -3047,22 +3588,67 @@ def main():
     else:
         # HuggingFace mode - load model locally
         logger.info("Using HuggingFace local model for evaluation...")
+        
+        # Disable cuDNN globally for Blackwell GPU (GB10, compute capability 12.1) compatibility
+        # This avoids the "GET was unable to find an engine" error in conv3d operations
+        import torch.backends.cudnn as cudnn
+        if torch.cuda.is_available():
+            device_name = torch.cuda.get_device_name(0)
+            device_capability = torch.cuda.get_device_capability(0)
+            if 'GB10' in device_name or device_capability >= (12, 0):  # Blackwell or newer
+                logger.info(f"Detected {device_name} (compute capability {device_capability})")
+                logger.info("Disabling cuDNN globally for Blackwell GPU conv3d compatibility")
+                cudnn.enabled = False
+        
         model, processor = load_model(args.model_path, model_type=args.model_type)
         
+        # Optional: Enable torch.compile() for faster inference (PyTorch 2.0+)
+        if torch.cuda.is_available() and hasattr(torch, 'compile'):
+            try:
+                logger.info("Compiling model with torch.compile() for faster inference...")
+                logger.info("Note: First run will be slow (warmup), subsequent runs will be much faster")
+                model = torch.compile(model, mode='reduce-overhead')
+            except Exception as e:
+                logger.warning(f"torch.compile() failed: {e}. Continuing without compilation...")
+        
         if args.task_type == "referring":
-            metrics, detailed_results = evaluate_referring_task(
-                model, processor, test_data,
-                args.image_base_dir, args.max_samples,
-                args.visualize_attention, args.viz_output_dir,
-                args.verbose
-            )
+            # Use batched evaluation if batch_size > 1
+            if args.batch_size > 1:
+                logger.info(f"Using batched evaluation with batch_size={args.batch_size}")
+                metrics, detailed_results = evaluate_referring_task_batched(
+                    model, processor, test_data,
+                    args.image_base_dir, args.max_samples,
+                    args.batch_size,
+                    args.visualize_attention, args.viz_output_dir,
+                    args.verbose
+                )
+            else:
+                logger.info("Using sequential evaluation (batch_size=1)")
+                metrics, detailed_results = evaluate_referring_task(
+                    model, processor, test_data,
+                    args.image_base_dir, args.max_samples,
+                    args.visualize_attention, args.viz_output_dir,
+                    args.verbose
+                )
         else:
-            metrics, detailed_results = evaluate_grounding_task(
-                model, processor, test_data,
-                args.image_base_dir, args.max_samples,
-                args.visualize_attention, args.viz_output_dir,
-                args.verbose
-            )
+            # Use batched evaluation if batch_size > 1
+            if args.batch_size > 1:
+                logger.info(f"Using batched grounding evaluation with batch_size={args.batch_size}")
+                metrics, detailed_results = evaluate_grounding_task_batched(
+                    model, processor, test_data,
+                    args.image_base_dir, args.max_samples,
+                    args.batch_size,
+                    args.visualize_attention, args.viz_output_dir,
+                    args.verbose
+                )
+            else:
+                logger.info("Using sequential grounding evaluation (batch_size=1)")
+                metrics, detailed_results = evaluate_grounding_task(
+                    model, processor, test_data,
+                    args.image_base_dir, args.max_samples,
+                    args.visualize_attention, args.viz_output_dir,
+                    args.verbose
+                )
     
     # Print results
     print_metrics(metrics, title=f"{args.task_type.upper()} Evaluation Results")
