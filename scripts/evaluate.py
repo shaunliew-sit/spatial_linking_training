@@ -2986,6 +2986,263 @@ def evaluate_grounding_task_vllm(
     return metrics, detailed_results
 
 
+def evaluate_grounding_task_vllm_single_turn(
+    test_data: List[Dict],
+    image_base_dir: str,
+    vllm_endpoint: str,
+    model_name: str,
+    max_samples: Optional[int] = None,
+    verbose: bool = False,
+    resume: bool = False,
+    checkpoint_interval: int = 100,
+    checkpoint_path: Optional[Path] = None,
+) -> Tuple[Dict, List[Dict]]:
+    """
+    Evaluate on grounding task using vLLM server with SINGLE-TURN inference (no tool calling).
+    
+    This is faster than the multi-turn agent loop version as it:
+    1. Makes only one inference call per sample
+    2. Does not execute any tools (zoom)
+    3. Directly parses the response for bounding boxes
+    
+    Use this for ablation studies comparing with/without tool-augmented reasoning.
+    
+    Args:
+        test_data: Test dataset
+        image_base_dir: Base directory for images
+        vllm_endpoint: vLLM server endpoint
+        model_name: Model name in vLLM
+        max_samples: Maximum samples to evaluate
+        verbose: Show detailed output
+        resume: Whether to resume from checkpoint
+        checkpoint_interval: Save checkpoint every N samples
+        checkpoint_path: Path to checkpoint file
+    
+    Returns:
+        Tuple of (metrics dict, detailed results list)
+    """
+    from utils.metrics import evaluate_grounding
+    
+    results = []
+    detailed_results = []
+    start_idx = 0
+    
+    # Load checkpoint if resuming
+    if resume and checkpoint_path:
+        if checkpoint_path.exists():
+            try:
+                with open(checkpoint_path, 'r') as f:
+                    checkpoint = json.load(f)
+                start_idx = checkpoint.get('last_processed_idx', 0) + 1
+                detailed_results = checkpoint.get('detailed_results', [])
+                results = checkpoint.get('results', [])
+                logger.info(f"Loaded checkpoint: {len(detailed_results)} samples processed, resuming from index {start_idx}")
+            except Exception as e:
+                logger.warning(f"Failed to load checkpoint: {e}. Starting from scratch.")
+                start_idx = 0
+    
+    samples = test_data[:max_samples] if max_samples else test_data
+    
+    # Check vLLM health
+    if not check_vllm_health(vllm_endpoint, model_name):
+        raise RuntimeError(f"vLLM server not healthy or model '{model_name}' not available")
+    
+    total_samples = len(samples)
+    logger.info(f"Starting vLLM single-turn grounding evaluation with {total_samples} samples (starting from {start_idx})")
+    
+    # System prompt for single-turn (simpler, no tool definitions)
+    single_turn_system_prompt = (
+        "You are a helpful assistant that can analyze images and locate human-object interactions. "
+        "When asked to locate interactions, provide bounding box coordinates in JSON format."
+    )
+    
+    for idx, sample in enumerate(tqdm(samples, desc="Evaluating grounding (vLLM single-turn)", initial=start_idx, total=total_samples)):
+        # Skip already processed samples
+        if idx < start_idx:
+            continue
+        try:
+            file_name = sample["file_name"]
+            action = sample["action"]
+            object_category = sample["object_category"]
+            boxes = sample.get("boxes_1000", sample.get("boxes", []))
+            num_pairs = sample.get("num_pairs", 1)
+            gt_box_inds = sample.get("gt_box_inds", list(range(num_pairs * 2)))
+            img_height = sample.get("height", 1000)
+            img_width = sample.get("width", 1000)
+            
+            # Build ground truth pairs
+            gt_pairs = []
+            for i in range(num_pairs):
+                person_idx = gt_box_inds[i * 2]
+                object_idx = gt_box_inds[i * 2 + 1]
+                
+                if person_idx < len(boxes) and object_idx < len(boxes):
+                    person_box_raw = boxes[person_idx]
+                    object_box_raw = boxes[object_idx]
+                    
+                    person_box = normalize_bbox_to_1000(person_box_raw, img_width, img_height)
+                    object_box = normalize_bbox_to_1000(object_box_raw, img_width, img_height)
+                    
+                    gt_pairs.append({
+                        "person_box": person_box,
+                        "object_box": object_box
+                    })
+            
+            if not gt_pairs:
+                continue
+            
+            # Load image
+            image_path = get_image_path(file_name, image_base_dir)
+            if not Path(image_path).exists():
+                logger.warning(f"Image not found: {image_path}")
+                continue
+            
+            image = Image.open(image_path).convert("RGB")
+            
+            # Create simple grounding prompt (no tool calling instructions)
+            user_prompt = (
+                f"Locate every person who is {action} {object_category} "
+                f"and the {object_category} they interact with.\n"
+                f"For each person-object pair, output bbox coordinates in JSON format like: "
+                f'[{{"person_box": [x1, y1, x2, y2], "object_box": [x1, y1, x2, y2]}}]. '
+                f"Coordinates should be in 1000x1000 normalized format.\n"
+                f"Provide your answer directly."
+            )
+            
+            # Build messages for single-turn inference
+            messages = [
+                {"role": "system", "content": single_turn_system_prompt},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": image},
+                        {"type": "text", "text": user_prompt}
+                    ]
+                }
+            ]
+            
+            # Single call to vLLM (no agent loop)
+            try:
+                generated = call_vllm(
+                    messages=messages,
+                    images=[image],
+                    endpoint=vllm_endpoint,
+                    model_name=model_name,
+                    max_tokens=500,
+                    temperature=0.0,  # Greedy for consistency
+                )
+            except Exception as e:
+                logger.error(f"vLLM call failed for {file_name}: {e}")
+                generated = ""
+            
+            # Parse predicted boxes
+            pred_pairs = parse_box_predictions(generated, (img_height, img_width))
+            
+            results.append({
+                "predicted_pairs": pred_pairs,
+                "gt_pairs": gt_pairs,
+            })
+            
+            # Parse response components for detailed logging
+            components = parse_response_components(generated)
+            
+            detailed_results.append({
+                "file_name": file_name,
+                "action": action,
+                "object_category": object_category,
+                "img_width": img_width,
+                "img_height": img_height,
+                "gt_pairs": gt_pairs,
+                "predicted_pairs": pred_pairs,
+                "num_pred": len(pred_pairs),
+                "num_gt": len(gt_pairs),
+                "full_response": generated,
+                "thinking": components['thinking'],
+                "answer_tag": components['answer'],
+                "mode": "single_turn",
+            })
+            
+            # Verbose output
+            if verbose and idx < 20:
+                print(f"\n{'='*60}")
+                print(f"[Sample {idx+1}] {file_name}")
+                print(f"{'='*60}")
+                print(f"  Action: {action} {object_category}")
+                print(f"  GT pairs: {len(gt_pairs)}")
+                for i, gt in enumerate(gt_pairs[:3]):
+                    print(f"    GT {i+1}: Person {gt['person_box']}, Object {gt['object_box']}")
+                
+                print(f"\n  Model Response (truncated):")
+                print(f"    {generated[:300]}...")
+                
+                print(f"\n  Predicted pairs: {len(pred_pairs)}")
+                for i, pair in enumerate(pred_pairs[:3]):
+                    print(f"    Pred {i+1}: Person {pair.get('person_box', [])}, Object {pair.get('object_box', [])}")
+                    # Calculate IoU for verbose output
+                    if gt_pairs:
+                        gt_person = gt_pairs[0].get('person_box', [])
+                        gt_object = gt_pairs[0].get('object_box', [])
+                        pred_person = pair.get('person_box', [])
+                        pred_object = pair.get('object_box', [])
+                        
+                        person_iou = calculate_iou(pred_person, gt_person) if pred_person and gt_person else 0.0
+                        object_iou = calculate_iou(pred_object, gt_object) if pred_object and gt_object else 0.0
+                        match_status = "✓" if person_iou >= 0.5 and object_iou >= 0.5 else "✗"
+                        print(f"    IoU {i+1}: Person={person_iou:.3f}, Object={object_iou:.3f} {match_status}")
+            
+            # Progress logging every 100 samples
+            if (idx + 1) % 100 == 0:
+                logger.info(f"Sample {idx+1}: Processed {file_name}, {len(pred_pairs)} predictions")
+            
+            # Save checkpoint periodically
+            if checkpoint_path and (idx + 1) % checkpoint_interval == 0:
+                save_checkpoint(
+                    checkpoint_path=checkpoint_path,
+                    last_processed_idx=idx,
+                    detailed_results=detailed_results,
+                    results=results,
+                )
+                
+        except Exception as e:
+            logger.error(f"Error processing sample {idx}: {e}")
+            import traceback
+            traceback.print_exc()
+            # Save checkpoint on error
+            if checkpoint_path and len(detailed_results) > 0:
+                save_checkpoint(
+                    checkpoint_path=checkpoint_path,
+                    last_processed_idx=idx - 1,
+                    detailed_results=detailed_results,
+                    results=results,
+                )
+            continue
+    
+    # Save final checkpoint before computing metrics
+    if checkpoint_path and len(detailed_results) > 0:
+        save_checkpoint(
+            checkpoint_path=checkpoint_path,
+            last_processed_idx=len(samples) - 1,
+            detailed_results=detailed_results,
+            results=results,
+        )
+    
+    # Compute metrics
+    logger.info(f"Computing grounding metrics for {len(results)} samples...")
+    metrics = evaluate_grounding(
+        [r["predicted_pairs"] for r in results],
+        [r["gt_pairs"] for r in results],
+    )
+    
+    metrics["num_samples"] = len(results)
+    metrics["mode"] = "single_turn"
+    
+    # Delete checkpoint after successful completion
+    if checkpoint_path:
+        delete_checkpoint(checkpoint_path)
+    
+    return metrics, detailed_results
+
+
 def format_attention_for_viz(
     attention_weights, 
     boxes: List[List[float]], 
@@ -3521,6 +3778,11 @@ def main():
         default=None,
         help="Model name in vLLM server (defaults to model_path basename)"
     )
+    parser.add_argument(
+        "--single_turn",
+        action="store_true",
+        help="Use single-turn inference for grounding (no tool calling, faster). For ablation studies."
+    )
     
     args = parser.parse_args()
     
@@ -3574,17 +3836,33 @@ def main():
                 checkpoint_path=checkpoint_path,
             )
         else:
-            metrics, detailed_results = evaluate_grounding_task_vllm(
-                test_data=test_data,
-                image_base_dir=args.image_base_dir,
-                vllm_endpoint=args.vllm_endpoint,
-                model_name=args.vllm_model,
-                max_samples=args.max_samples,
-                verbose=args.verbose,
-                resume=args.resume,
-                checkpoint_interval=args.checkpoint_interval,
-                checkpoint_path=checkpoint_path,
-            )
+            # Choose between single-turn (no tool calling) and multi-turn (with tool calling)
+            if args.single_turn:
+                logger.info("Using SINGLE-TURN grounding evaluation (no tool calling)")
+                metrics, detailed_results = evaluate_grounding_task_vllm_single_turn(
+                    test_data=test_data,
+                    image_base_dir=args.image_base_dir,
+                    vllm_endpoint=args.vllm_endpoint,
+                    model_name=args.vllm_model,
+                    max_samples=args.max_samples,
+                    verbose=args.verbose,
+                    resume=args.resume,
+                    checkpoint_interval=args.checkpoint_interval,
+                    checkpoint_path=checkpoint_path,
+                )
+            else:
+                logger.info("Using MULTI-TURN grounding evaluation (with tool calling)")
+                metrics, detailed_results = evaluate_grounding_task_vllm(
+                    test_data=test_data,
+                    image_base_dir=args.image_base_dir,
+                    vllm_endpoint=args.vllm_endpoint,
+                    model_name=args.vllm_model,
+                    max_samples=args.max_samples,
+                    verbose=args.verbose,
+                    resume=args.resume,
+                    checkpoint_interval=args.checkpoint_interval,
+                    checkpoint_path=checkpoint_path,
+                )
     else:
         # HuggingFace mode - load model locally
         logger.info("Using HuggingFace local model for evaluation...")
