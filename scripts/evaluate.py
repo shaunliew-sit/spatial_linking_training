@@ -46,9 +46,11 @@ from datetime import datetime
 from tqdm import tqdm
 
 import torch
+import torch.multiprocessing as mp
 import requests
 from transformers import AutoProcessor
 from PIL import Image
+from dataclasses import dataclass, field, asdict
 
 # Fix cuDNN Conv3d algorithm selection issue for Qwen3-VL vision encoder
 # The "GET was unable to find an engine to execute this computation" error
@@ -3541,7 +3543,15 @@ def save_results(
                 f.write(f"  Image size: {result.get('img_width', 'N/A')}x{result.get('img_height', 'N/A')}\n")
                 f.write(f"\n  Ground Truth Pairs ({len(result.get('gt_pairs', []))}):\n")
                 for j, gt in enumerate(result.get('gt_pairs', [])):
-                    f.write(f"    GT {j+1}: Person {gt.get('person_box', 'N/A')}, Object {gt.get('object_box', 'N/A')}\n")
+                    # Handle both tuple format (person_box, object_box) and dict format
+                    if isinstance(gt, (list, tuple)) and len(gt) >= 2:
+                        person_box, object_box = gt[0], gt[1]
+                    elif isinstance(gt, dict):
+                        person_box = gt.get('person_box', 'N/A')
+                        object_box = gt.get('object_box', 'N/A')
+                    else:
+                        person_box, object_box = 'N/A', 'N/A'
+                    f.write(f"    GT {j+1}: Person {person_box}, Object {object_box}\n")
                 f.write("\n")
             
             # Number of turns
@@ -3663,6 +3673,858 @@ def save_results(
 
 
 # =============================================================================
+# MULTI-GPU EVALUATION SUPPORT
+# =============================================================================
+
+def _compute_interaction_box_local(person_box: List, object_box: List) -> List:
+    """Compute interaction box as union of person and object boxes."""
+    return [
+        min(person_box[0], object_box[0]),
+        min(person_box[1], object_box[1]),
+        max(person_box[2], object_box[2]),
+        max(person_box[3], object_box[3])
+    ]
+
+
+def _worker_init_model(gpu_id: int, args_dict: Dict) -> Tuple[Any, Any]:
+    """
+    Initialize model on a specific GPU for worker process.
+    
+    Args:
+        gpu_id: GPU ID to use
+        args_dict: Dictionary with model configuration
+        
+    Returns:
+        Tuple of (model, processor)
+    """
+    import warnings
+    import sys
+    import torch
+    from pathlib import Path
+    from peft import PeftModel
+    
+    # Ensure parent directory is in path for imports
+    parent_dir = str(Path(__file__).parent.parent)
+    if parent_dir not in sys.path:
+        sys.path.insert(0, parent_dir)
+    
+    from models.spatial_model import SpatialLinkingInteractionModel
+    
+    device = f"cuda:{gpu_id}"
+    print(f"[Worker {gpu_id}] Initializing model on {device}")
+    
+    # Suppress warnings
+    warnings.filterwarnings("ignore", message=".*torch_dtype.*deprecated.*")
+    warnings.filterwarnings("ignore", message=".*Some weights.*were not initialized.*")
+    
+    model_path = args_dict['model_path']
+    model_type = args_dict.get('model_type', 'auto')
+    use_compile = args_dict.get('use_compile', False)
+    load_in_8bit = args_dict.get('load_in_8bit', False)
+    load_in_4bit = args_dict.get('load_in_4bit', False)
+    
+    # Prepare quantization config if requested
+    quantization_config = None
+    model_dtype = torch.bfloat16
+    
+    if load_in_4bit:
+        try:
+            from transformers import BitsAndBytesConfig
+            quantization_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4"
+            )
+            print(f"[Worker {gpu_id}] Using 4-bit quantization")
+        except ImportError:
+            print(f"[Worker {gpu_id}] bitsandbytes not available, using BF16")
+    elif load_in_8bit:
+        try:
+            from transformers import BitsAndBytesConfig
+            quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+            print(f"[Worker {gpu_id}] Using 8-bit quantization")
+        except ImportError:
+            print(f"[Worker {gpu_id}] bitsandbytes not available, using BF16")
+    
+    # Load processor
+    try:
+        processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+    except Exception:
+        processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-8B-Instruct", trust_remote_code=True)
+    
+    if processor.tokenizer.pad_token is None:
+        processor.tokenizer.pad_token = processor.tokenizer.eos_token
+    
+    # Auto-detect model type
+    if model_type == "auto":
+        spatial_linking_path = os.path.join(model_path, "spatial_linking.pt")
+        adapter_config_path = os.path.join(model_path, "adapter_config.json")
+        if os.path.exists(spatial_linking_path):
+            model_type = "spatial_linking"
+        elif os.path.exists(adapter_config_path):
+            model_type = "base"
+        else:
+            model_type = "spatial_linking"
+    
+    if model_type == "spatial_linking":
+        # Load SpatialLinkingInteractionModel
+        adapter_config_path = os.path.join(model_path, "adapter_config.json")
+        has_peft = os.path.exists(adapter_config_path)
+        
+        if has_peft:
+            with open(adapter_config_path, 'r') as f:
+                adapter_config = json.load(f)
+            base_model_name = adapter_config.get("base_model_name_or_path", "Qwen/Qwen3-VL-8B-Instruct")
+            
+            # Load base model (quantization not supported with spatial linking custom model)
+            base_model = SpatialLinkingInteractionModel.from_pretrained(
+                base_model_name,
+                torch_dtype=model_dtype,
+                trust_remote_code=True,
+                device_map=device,
+            )
+            
+            # Load PEFT adapters
+            model = PeftModel.from_pretrained(base_model, model_path)
+            print(f"[Worker {gpu_id}] LoRA adapter loaded")
+        else:
+            model = SpatialLinkingInteractionModel.from_pretrained(
+                model_path,
+                torch_dtype=torch.bfloat16,
+                trust_remote_code=True,
+                device_map=device,
+            )
+        
+        # Load spatial linking weights
+        spatial_linking_path = os.path.join(model_path, "spatial_linking.pt")
+        if os.path.exists(spatial_linking_path):
+            spatial_state = torch.load(spatial_linking_path, map_location="cpu")
+            if has_peft:
+                if hasattr(model, 'base_model') and hasattr(model.base_model, 'model'):
+                    if hasattr(model.base_model.model, 'spatial_linking'):
+                        model.base_model.model.spatial_linking.load_state_dict(spatial_state)
+                elif hasattr(model, 'base_model') and hasattr(model.base_model, 'spatial_linking'):
+                    model.base_model.spatial_linking.load_state_dict(spatial_state)
+            else:
+                if hasattr(model, 'spatial_linking'):
+                    model.spatial_linking.load_state_dict(spatial_state)
+            print(f"[Worker {gpu_id}] Spatial linking weights loaded")
+        
+        # Set box token IDs
+        if has_peft:
+            if hasattr(model, 'base_model') and hasattr(model.base_model, 'model'):
+                model.base_model.model.set_box_token_ids(processor.tokenizer)
+            elif hasattr(model, 'base_model'):
+                model.base_model.set_box_token_ids(processor.tokenizer)
+        else:
+            model.set_box_token_ids(processor.tokenizer)
+    else:
+        # Load base Qwen3-VL with LoRA
+        from transformers import Qwen2_5_VLForConditionalGeneration
+        
+        adapter_config_path = os.path.join(model_path, "adapter_config.json")
+        if os.path.exists(adapter_config_path):
+            with open(adapter_config_path, 'r') as f:
+                adapter_config = json.load(f)
+            base_model_name = adapter_config.get("base_model_name_or_path", "Qwen/Qwen3-VL-8B-Instruct")
+        else:
+            base_model_name = "Qwen/Qwen3-VL-8B-Instruct"
+        
+        try:
+            from transformers import Qwen3VLForConditionalGeneration
+            base_model = Qwen3VLForConditionalGeneration.from_pretrained(
+                base_model_name,
+                torch_dtype=torch.bfloat16,
+                trust_remote_code=True,
+                device_map=device,
+            )
+        except ImportError:
+            from transformers import AutoModelForCausalLM
+            base_model = AutoModelForCausalLM.from_pretrained(
+                base_model_name,
+                torch_dtype=torch.bfloat16,
+                trust_remote_code=True,
+                device_map=device,
+            )
+        
+        model = PeftModel.from_pretrained(base_model, model_path)
+        print(f"[Worker {gpu_id}] LoRA adapter loaded")
+    
+    model.eval()
+    
+    # Apply torch.compile if requested (PyTorch 2.0+)
+    if use_compile:
+        try:
+            import torch._dynamo
+            torch._dynamo.config.suppress_errors = True
+            model = torch.compile(model, mode="reduce-overhead")
+            print(f"[Worker {gpu_id}] torch.compile applied")
+        except Exception as e:
+            print(f"[Worker {gpu_id}] torch.compile failed: {e}, continuing without compilation")
+    
+    print(f"[Worker {gpu_id}] Model ready on {device}")
+    
+    return model, processor
+
+
+def worker_evaluate_referring(
+    gpu_id: int,
+    samples_data: List[Dict],
+    args_dict: Dict
+) -> Tuple[List[str], List[str], List[Dict]]:
+    """
+    Worker function to evaluate referring task on a specific GPU.
+    
+    Args:
+        gpu_id: GPU ID to use
+        samples_data: List of sample dictionaries
+        args_dict: Arguments dictionary
+        
+    Returns:
+        Tuple of (predictions, references, detailed_results)
+    """
+    from utils.metrics import evaluate_referring_nltk, evaluate_referring_simple
+    
+    # Initialize model
+    model, processor = _worker_init_model(gpu_id, args_dict)
+    device = next(model.parameters()).device
+    
+    predictions = []
+    references = []
+    detailed_results = []
+    
+    image_base_dir = args_dict['image_base_dir']
+    verbose = args_dict.get('verbose', False)
+    
+    for idx, sample in enumerate(tqdm(samples_data, desc=f"[GPU {gpu_id}] Referring", position=gpu_id)):
+        try:
+            file_name = sample["file_name"]
+            boxes = sample.get("boxes_1000", sample.get("boxes", []))
+            person_idx = sample.get("person_box_idx", 0)
+            object_idx = sample.get("object_box_idx", 1)
+            gt_action = sample.get("gt_action", sample.get("action", ""))
+            
+            if len(boxes) < 2:
+                continue
+            
+            person_box = boxes[person_idx]
+            object_box = boxes[object_idx]
+            
+            # Load image
+            image_path = get_image_path(file_name, image_base_dir)
+            image = Image.open(image_path).convert('RGB')
+            
+            # Create prompt
+            prompt_content = create_referring_prompt_with_image(person_box, object_box, image)
+            
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt_content}
+            ]
+            
+            # Apply chat template
+            text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            
+            # Prepare refer_boxes for spatial linking
+            interaction_box = _compute_interaction_box_local(person_box, object_box)
+            refer_boxes = torch.tensor(
+                [[person_box, object_box, interaction_box]],
+                dtype=torch.float32
+            ).to(device)
+            
+            # Process inputs
+            inputs = processor(
+                text=[text],
+                images=[image],
+                return_tensors="pt",
+                truncation=True,
+                max_length=4096,
+            ).to(device)
+            
+            # Add refer_boxes
+            inputs['refer_boxes'] = refer_boxes
+            
+            # Generate
+            with torch.no_grad():
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=256,
+                    do_sample=False,
+                    temperature=None,
+                    top_p=None,
+                    pad_token_id=processor.tokenizer.pad_token_id,
+                )
+            
+            # Decode
+            generated_ids = outputs[0][inputs['input_ids'].shape[1]:]
+            generated_text = processor.tokenizer.decode(generated_ids, skip_special_tokens=True)
+            
+            # Parse answer
+            parsed_answer = parse_answer(generated_text)
+            cleaned_answer = clean_action_response(parsed_answer)
+            
+            predictions.append(cleaned_answer)
+            references.append(gt_action)
+            
+            # Parse components for detailed results
+            components = parse_response_components(generated_text)
+            
+            detailed_results.append({
+                'file_name': file_name,
+                'gt_action': gt_action,
+                'predicted': cleaned_answer,
+                'raw_answer': parsed_answer,
+                'full_response': generated_text[:500],
+                'thinking': components.get('thinking', ''),
+                'has_tool_call': components.get('has_tool_call', False),
+                'answer_tag': components.get('answer', ''),
+                'tool_calls': components.get('tool_calls', []),
+            })
+            
+            if verbose:
+                print(f"[GPU {gpu_id}] Sample {idx}: GT='{gt_action}', Pred='{cleaned_answer}'")
+                
+        except Exception as e:
+            if verbose:
+                print(f"[GPU {gpu_id}] Error processing sample {idx}: {e}")
+            continue
+    
+    print(f"[Worker {gpu_id}] Completed {len(predictions)} referring samples")
+    return predictions, references, detailed_results
+
+
+def worker_evaluate_grounding(
+    gpu_id: int,
+    samples_data: List[Dict],
+    args_dict: Dict,
+    checkpoint_interval: int = 100,
+    checkpoint_dir: str = "./eval_checkpoints"
+) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Worker function to evaluate grounding task on a specific GPU.
+    
+    Args:
+        gpu_id: GPU ID to use
+        samples_data: List of sample dictionaries
+        args_dict: Arguments dictionary
+        checkpoint_interval: Save checkpoint every N samples
+        checkpoint_dir: Directory for checkpoint files
+        
+    Returns:
+        Tuple of (results, detailed_results)
+    """
+    import json
+    from pathlib import Path
+    
+    # Initialize model
+    model, processor = _worker_init_model(gpu_id, args_dict)
+    device = next(model.parameters()).device
+    
+    results = []
+    detailed_results = []
+    
+    image_base_dir = args_dict['image_base_dir']
+    verbose = args_dict.get('verbose', False)
+    
+    # Setup worker checkpoint
+    worker_checkpoint_path = Path(checkpoint_dir) / f"worker_{gpu_id}_grounding.json"
+    worker_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    for idx, sample in enumerate(tqdm(samples_data, desc=f"[GPU {gpu_id}] Grounding", position=gpu_id)):
+        try:
+            file_name = sample["file_name"]
+            action = sample.get("action", "")
+            object_category = sample.get("object_category", sample.get("object", ""))
+            boxes = sample.get("boxes_1000", sample.get("boxes", []))
+            gt_box_inds = sample.get("gt_box_inds", [])
+            width = sample.get("width", 1000)
+            height = sample.get("height", 1000)
+            
+            # Load image
+            image_path = get_image_path(file_name, image_base_dir)
+            image = Image.open(image_path).convert('RGB')
+            
+            # Create prompt
+            prompt_content = create_grounding_prompt_with_image(action, object_category, image)
+            
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt_content}
+            ]
+            
+            # Apply chat template
+            text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            
+            # Process inputs (no refer_boxes for grounding - model outputs them)
+            inputs = processor(
+                text=[text],
+                images=[image],
+                return_tensors="pt",
+                truncation=True,
+                max_length=4096,
+            ).to(device)
+            
+            # Generate
+            with torch.no_grad():
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=512,
+                    do_sample=False,
+                    temperature=None,
+                    top_p=None,
+                    pad_token_id=processor.tokenizer.pad_token_id,
+                )
+            
+            # Decode
+            generated_ids = outputs[0][inputs['input_ids'].shape[1]:]
+            generated_text = processor.tokenizer.decode(generated_ids, skip_special_tokens=True)
+            
+            # Parse bounding boxes from response
+            predicted_pairs = parse_box_predictions(generated_text)
+            
+            # Get GT pairs and normalize to 1000x1000 format
+            gt_pairs = []
+            gt_pairs_pixel = []  # Keep original pixel coords for size-based metrics
+            if len(gt_box_inds) >= 2:
+                for i in range(0, len(gt_box_inds), 2):
+                    if i + 1 < len(gt_box_inds):
+                        person_idx = gt_box_inds[i]
+                        object_idx = gt_box_inds[i + 1]
+                        if person_idx < len(boxes) and object_idx < len(boxes):
+                            person_box_px = boxes[person_idx]
+                            object_box_px = boxes[object_idx]
+                            gt_pairs_pixel.append((person_box_px, object_box_px))
+                            
+                            # Normalize to 1000x1000 format for IoU comparison
+                            person_box_norm = [
+                                int(person_box_px[0] * 1000 / width),
+                                int(person_box_px[1] * 1000 / height),
+                                int(person_box_px[2] * 1000 / width),
+                                int(person_box_px[3] * 1000 / height),
+                            ]
+                            object_box_norm = [
+                                int(object_box_px[0] * 1000 / width),
+                                int(object_box_px[1] * 1000 / height),
+                                int(object_box_px[2] * 1000 / width),
+                                int(object_box_px[3] * 1000 / height),
+                            ]
+                            gt_pairs.append((person_box_norm, object_box_norm))
+            
+            # Compute metrics with size-based breakdown
+            sample_metrics = compute_grounding_metrics_single(
+                predicted_pairs, gt_pairs, gt_pairs_pixel, width, height
+            )
+            
+            # Parse components
+            components = parse_response_components(generated_text)
+            
+            result = {
+                'file_name': file_name,
+                'action': action,
+                'object': object_category,
+                'predicted_pairs': predicted_pairs,
+                'gt_pairs': gt_pairs,
+                'gt_pairs_pixel': gt_pairs_pixel,
+                'metrics': sample_metrics,
+                'width': width,
+                'height': height,
+            }
+            results.append(result)
+            
+            detailed_results.append({
+                'file_name': file_name,
+                'action': action,
+                'object': object_category,
+                'predicted_pairs': predicted_pairs,
+                'gt_pairs': gt_pairs,
+                'gt_pairs_pixel': gt_pairs_pixel,
+                'metrics': sample_metrics,
+                'width': width,
+                'height': height,
+                'full_response': generated_text[:500],
+                'thinking': components.get('thinking', ''),
+                'has_tool_call': components.get('has_tool_call', False),
+                'answer_tag': components.get('answer', ''),
+                'tool_calls': components.get('tool_calls', []),
+            })
+            
+            if verbose:
+                recall = sample_metrics.get('recall@0.5', 0)
+                print(f"[GPU {gpu_id}] Sample {idx}: Recall@0.5={recall:.2f}")
+            
+            # Save checkpoint periodically
+            if checkpoint_interval > 0 and (idx + 1) % checkpoint_interval == 0:
+                checkpoint_data = {
+                    'gpu_id': gpu_id,
+                    'processed': idx + 1,
+                    'total': len(samples_data),
+                    'results': results,
+                    'detailed_results': detailed_results,
+                }
+                with open(worker_checkpoint_path, 'w') as f:
+                    json.dump(checkpoint_data, f)
+                print(f"[Worker {gpu_id}] Checkpoint saved: {idx + 1}/{len(samples_data)} samples")
+                
+        except Exception as e:
+            if verbose:
+                print(f"[GPU {gpu_id}] Error processing sample {idx}: {e}")
+            continue
+    
+    # Save final checkpoint
+    if checkpoint_interval > 0:
+        checkpoint_data = {
+            'gpu_id': gpu_id,
+            'processed': len(results),
+            'total': len(samples_data),
+            'results': results,
+            'detailed_results': detailed_results,
+            'completed': True,
+        }
+        with open(worker_checkpoint_path, 'w') as f:
+            json.dump(checkpoint_data, f)
+    
+    print(f"[Worker {gpu_id}] Completed {len(results)} grounding samples")
+    return results, detailed_results
+
+
+def run_multi_gpu_evaluation(
+    task_type: str,
+    test_data: List[Dict],
+    args: argparse.Namespace,
+    num_gpus: int,
+    resume: bool = False,
+    checkpoint_dir: str = "./eval_checkpoints",
+    checkpoint_interval: int = 100
+) -> Tuple[Dict, List[Dict]]:
+    """
+    Run evaluation in parallel across multiple GPUs with resume support.
+    
+    Args:
+        task_type: 'referring' or 'grounding'
+        test_data: List of test samples
+        args: Parsed arguments
+        num_gpus: Number of GPUs to use
+        resume: Whether to resume from checkpoint
+        checkpoint_dir: Directory for checkpoint files
+        checkpoint_interval: Save checkpoint every N samples per worker
+        
+    Returns:
+        Tuple of (metrics, detailed_results)
+    """
+    from utils.metrics import evaluate_referring_nltk, evaluate_referring_simple
+    
+    # Limit samples if specified
+    samples = test_data[:args.max_samples] if args.max_samples else test_data
+    
+    # Setup checkpoint path for multi-GPU
+    test_name = Path(args.test_file).stem
+    checkpoint_path = Path(checkpoint_dir) / f"multigpu_checkpoint_{task_type}_{test_name}.json"
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Resume support: load previously completed samples
+    completed_keys = set()
+    previous_results = []
+    previous_detailed = []
+    previous_predictions = []
+    previous_references = []
+    
+    if resume and checkpoint_path.exists():
+        try:
+            with open(checkpoint_path, 'r') as f:
+                checkpoint = json.load(f)
+            previous_detailed = checkpoint.get('detailed_results', [])
+            previous_results = checkpoint.get('results', [])
+            previous_predictions = checkpoint.get('predictions', [])
+            previous_references = checkpoint.get('references', [])
+            
+            # Build set of completed sample keys (file_name + action)
+            for d in previous_detailed:
+                key = f"{d.get('file_name', '')}_{d.get('action', '')}"
+                completed_keys.add(key)
+            
+            logger.info(f"Resuming: {len(completed_keys)} samples already processed, skipping...")
+        except Exception as e:
+            logger.warning(f"Failed to load checkpoint: {e}. Starting from scratch.")
+    
+    # Filter out already-processed samples
+    if completed_keys:
+        remaining_samples = []
+        for s in samples:
+            key = f"{s.get('file_name', '')}_{s.get('action', '')}"
+            if key not in completed_keys:
+                remaining_samples.append(s)
+        logger.info(f"Remaining samples to process: {len(remaining_samples)}")
+        samples = remaining_samples
+    
+    if not samples:
+        logger.info("All samples already processed!")
+        # Just compute metrics from previous results
+        if task_type == "referring":
+            try:
+                metrics = evaluate_referring_nltk(previous_predictions, previous_references)
+            except Exception:
+                metrics = evaluate_referring_simple(previous_predictions, previous_references)
+            metrics['num_samples'] = len(previous_predictions)
+            return metrics, previous_detailed
+        else:
+            metrics = aggregate_grounding_metrics(previous_results)
+            return metrics, previous_detailed
+    
+    # Convert args to serializable dict
+    args_dict = {
+        'model_path': args.model_path,
+        'model_type': args.model_type,
+        'image_base_dir': args.image_base_dir,
+        'verbose': args.verbose,
+        'use_compile': getattr(args, 'use_compile', False),
+        'load_in_8bit': getattr(args, 'load_in_8bit', False),
+        'load_in_4bit': getattr(args, 'load_in_4bit', False),
+    }
+    
+    # Split samples across GPUs
+    chunk_size = (len(samples) + num_gpus - 1) // num_gpus
+    chunks = []
+    for i in range(num_gpus):
+        start_idx = i * chunk_size
+        end_idx = min(start_idx + chunk_size, len(samples))
+        if start_idx < len(samples):
+            chunks.append(samples[start_idx:end_idx])
+    
+    actual_num_gpus = len(chunks)
+    logger.info(f"Distributing {len(samples)} samples across {actual_num_gpus} GPUs")
+    for i, chunk in enumerate(chunks):
+        logger.info(f"  GPU {i}: {len(chunk)} samples")
+    
+    # Use spawn method for CUDA compatibility
+    mp.set_start_method('spawn', force=True)
+    
+    # Prepare worker arguments
+    if task_type == "referring":
+        worker_fn = worker_evaluate_referring
+        worker_args = [
+            (gpu_id, chunks[gpu_id], args_dict)
+            for gpu_id in range(actual_num_gpus)
+        ]
+    else:
+        worker_fn = worker_evaluate_grounding
+        worker_args = [
+            (gpu_id, chunks[gpu_id], args_dict, checkpoint_interval, checkpoint_dir)
+            for gpu_id in range(actual_num_gpus)
+        ]
+    
+    # Run in parallel using Pool
+    logger.info("Starting parallel evaluation...")
+    
+    with mp.Pool(processes=actual_num_gpus) as pool:
+        results_list = pool.starmap(worker_fn, worker_args)
+    
+    # Aggregate results
+    if task_type == "referring":
+        all_predictions = list(previous_predictions)
+        all_references = list(previous_references)
+        all_detailed = list(previous_detailed)
+        
+        for predictions, references, detailed in results_list:
+            all_predictions.extend(predictions)
+            all_references.extend(references)
+            all_detailed.extend(detailed)
+        
+        # Save checkpoint with all results
+        checkpoint_data = {
+            'last_processed_idx': len(all_detailed) - 1,
+            'detailed_results': all_detailed,
+            'predictions': all_predictions,
+            'references': all_references,
+        }
+        with open(checkpoint_path, 'w') as f:
+            json.dump(checkpoint_data, f)
+        logger.info(f"Checkpoint saved: {len(all_detailed)} samples total")
+        
+        # Compute metrics
+        logger.info("Computing referring metrics...")
+        try:
+            metrics = evaluate_referring_nltk(all_predictions, all_references)
+        except Exception:
+            metrics = evaluate_referring_simple(all_predictions, all_references)
+        
+        metrics['num_samples'] = len(all_predictions)
+        
+        logger.info(f"Multi-GPU evaluation complete: {len(all_predictions)} results")
+        
+        # Delete checkpoint on successful completion
+        if checkpoint_path.exists():
+            checkpoint_path.unlink()
+            logger.info("Checkpoint deleted after successful completion")
+        
+        return metrics, all_detailed
+    
+    else:  # grounding
+        all_results = list(previous_results)
+        all_detailed = list(previous_detailed)
+        
+        for results, detailed in results_list:
+            all_results.extend(results)
+            all_detailed.extend(detailed)
+        
+        # Save checkpoint with all results
+        checkpoint_data = {
+            'last_processed_idx': len(all_detailed) - 1,
+            'detailed_results': all_detailed,
+            'results': all_results,
+        }
+        with open(checkpoint_path, 'w') as f:
+            json.dump(checkpoint_data, f)
+        logger.info(f"Checkpoint saved: {len(all_detailed)} samples total")
+        
+        # Aggregate grounding metrics
+        metrics = aggregate_grounding_metrics(all_results)
+        
+        logger.info(f"Multi-GPU evaluation complete: {len(all_results)} results")
+        
+        # Delete checkpoint on successful completion
+        if checkpoint_path.exists():
+            checkpoint_path.unlink()
+            logger.info("Checkpoint deleted after successful completion")
+        
+        return metrics, all_detailed
+
+
+def aggregate_grounding_metrics(results: List[Dict]) -> Dict:
+    """Aggregate grounding metrics from multiple results with size breakdown."""
+    if not results:
+        return {'AR@0.5': 0, 'num_samples': 0}
+    
+    # Collect all per-sample metrics
+    recalls_at_thresholds = {t: [] for t in [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]}
+    recalls_by_size = {'small': [], 'medium': [], 'large': []}
+    
+    for r in results:
+        m = r.get('metrics', {})
+        
+        # Collect recalls at different thresholds
+        for t in recalls_at_thresholds.keys():
+            key = f'recall@{t}'
+            if key in m:
+                recalls_at_thresholds[t].append(m[key])
+        
+        # Collect size-based recalls
+        for size in ['small', 'medium', 'large']:
+            key = f'recall_{size}'
+            if key in m and m[key] is not None:
+                recalls_by_size[size].extend(m[key] if isinstance(m[key], list) else [m[key]])
+    
+    metrics = {
+        'num_samples': len(results),
+    }
+    
+    # Compute AR at each threshold
+    all_ars = []
+    for t, recalls in recalls_at_thresholds.items():
+        if recalls:
+            ar = sum(recalls) / len(recalls)
+            metrics[f'AR@{t}'] = ar
+            all_ars.append(ar)
+    
+    # Compute overall AR (average across thresholds)
+    if all_ars:
+        metrics['AR'] = sum(all_ars) / len(all_ars)
+    
+    # Compute size-based AR
+    for size, recalls in recalls_by_size.items():
+        if recalls:
+            metrics[f'AR{size[0]}'] = sum(recalls) / len(recalls)
+    
+    return metrics
+
+
+def compute_grounding_metrics_single(
+    predicted_pairs: List, 
+    gt_pairs: List,
+    gt_pairs_pixel: List = None,
+    width: int = 1000,
+    height: int = 1000
+) -> Dict:
+    """Compute grounding metrics for a single sample with size breakdown."""
+    if not gt_pairs:
+        return {'recall@0.5': 0, 'recall@0.75': 0}
+    
+    def box_iou(box1, box2):
+        """Compute IoU between two boxes."""
+        x1 = max(box1[0], box2[0])
+        y1 = max(box1[1], box2[1])
+        x2 = min(box1[2], box2[2])
+        y2 = min(box1[3], box2[3])
+        
+        inter = max(0, x2 - x1) * max(0, y2 - y1)
+        area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+        area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+        union = area1 + area2 - inter
+        
+        return inter / union if union > 0 else 0
+    
+    def count_matches(threshold):
+        matched = 0
+        used_preds = set()
+        matched_gt_indices = []
+        
+        for gt_idx, (gt_person, gt_object) in enumerate(gt_pairs):
+            for i, pred in enumerate(predicted_pairs):
+                if i in used_preds:
+                    continue
+                pred_person = pred.get('person_box', pred.get('person', []))
+                pred_object = pred.get('object_box', pred.get('object', []))
+                
+                if (box_iou(pred_person, gt_person) >= threshold and 
+                    box_iou(pred_object, gt_object) >= threshold):
+                    matched += 1
+                    used_preds.add(i)
+                    matched_gt_indices.append(gt_idx)
+                    break
+        
+        return matched, matched_gt_indices
+    
+    # Compute recalls at multiple thresholds
+    thresholds = [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]
+    metrics = {}
+    
+    for t in thresholds:
+        matches, _ = count_matches(t)
+        metrics[f'recall@{t}'] = matches / len(gt_pairs)
+    
+    # Compute size-based metrics at IoU 0.5 using normalized 1000x1000 coordinates
+    # This matches the reference implementation in eval_hoi_spatial_agent.py
+    size_recalls = {'small': [], 'medium': [], 'large': []}
+    _, matched_indices = count_matches(0.5)
+    matched_set = set(matched_indices)
+    
+    for gt_idx, (person_box_norm, object_box_norm) in enumerate(gt_pairs):
+        # Compute person box area in normalized 1000x1000 space
+        # person_box_norm is already in 1000x1000 format
+        person_area = (person_box_norm[2] - person_box_norm[0]) * (person_box_norm[3] - person_box_norm[1])
+        
+        # Determine size category (same thresholds as reference)
+        # Small: area < 32^2 = 1024, Medium: 32^2 <= area < 96^2 = 9216, Large: area >= 96^2
+        if person_area < 32 * 32:
+            size = 'small'
+        elif person_area < 96 * 96:
+            size = 'medium'
+        else:
+            size = 'large'
+        
+        # Check if this GT was matched
+        is_matched = 1.0 if gt_idx in matched_set else 0.0
+        size_recalls[size].append(is_matched)
+    
+    # Store size-based recalls for aggregation
+    metrics['recall_small'] = size_recalls['small']
+    metrics['recall_medium'] = size_recalls['medium']
+    metrics['recall_large'] = size_recalls['large']
+    
+    return metrics
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
@@ -3738,7 +4600,22 @@ def main():
         "--batch_size",
         type=int,
         default=1,
-        help="Batch size for evaluation (default: 1 sequential, recommended: 8 for 100GB VRAM)"
+        help="Batch size for evaluation (default: 1 sequential, recommended: 4-8 for H200)"
+    )
+    parser.add_argument(
+        "--use_compile",
+        action="store_true",
+        help="Use torch.compile for faster inference (PyTorch 2.0+)"
+    )
+    parser.add_argument(
+        "--load_in_8bit",
+        action="store_true",
+        help="Load model in 8-bit quantization for faster inference (~2x speedup, minimal accuracy loss)"
+    )
+    parser.add_argument(
+        "--load_in_4bit",
+        action="store_true",
+        help="Load model in 4-bit quantization for faster inference (~3x speedup, some accuracy loss)"
     )
     
     # Resume/checkpoint arguments
@@ -3784,6 +4661,14 @@ def main():
         help="Use single-turn inference for grounding (no tool calling, faster). For ablation studies."
     )
     
+    # Multi-GPU arguments
+    parser.add_argument(
+        "--num_gpus",
+        type=int,
+        default=1,
+        help="Number of GPUs for parallel evaluation (default: 1). Use 8 for 8-GPU systems."
+    )
+    
     args = parser.parse_args()
     
     # Determine vLLM model name
@@ -3808,6 +4693,8 @@ def main():
         print(f"  Mode:        vLLM Server")
         print(f"  Endpoint:    {args.vllm_endpoint}")
         print(f"  vLLM Model:  {args.vllm_model}")
+    elif args.num_gpus > 1:
+        print(f"  Mode:        Multi-GPU HuggingFace ({args.num_gpus} GPUs)")
     else:
         print(f"  Mode:        HuggingFace Local")
     if args.resume:
@@ -3863,7 +4750,35 @@ def main():
                     checkpoint_interval=args.checkpoint_interval,
                     checkpoint_path=checkpoint_path,
                 )
-    else:
+    elif args.num_gpus > 1:
+        # Multi-GPU mode - parallel evaluation across GPUs
+        logger.info(f"Using Multi-GPU evaluation with {args.num_gpus} GPUs...")
+        
+        # Check available GPUs
+        available_gpus = torch.cuda.device_count()
+        if available_gpus < args.num_gpus:
+            logger.warning(f"Requested {args.num_gpus} GPUs but only {available_gpus} available. Using {available_gpus}.")
+            actual_num_gpus = available_gpus
+        else:
+            actual_num_gpus = args.num_gpus
+        
+        if actual_num_gpus < 2:
+            logger.warning("Less than 2 GPUs available. Falling back to single GPU mode.")
+            # Fall through to single GPU mode below
+            args.num_gpus = 1
+        else:
+            metrics, detailed_results = run_multi_gpu_evaluation(
+                task_type=args.task_type,
+                test_data=test_data,
+                args=args,
+                num_gpus=actual_num_gpus,
+                resume=args.resume,
+                checkpoint_dir=args.checkpoint_dir,
+                checkpoint_interval=args.checkpoint_interval
+            )
+    
+    # Single GPU HuggingFace mode (when num_gpus=1 or fallback)
+    if not args.use_vllm and args.num_gpus <= 1:
         # HuggingFace mode - load model locally
         logger.info("Using HuggingFace local model for evaluation...")
         
